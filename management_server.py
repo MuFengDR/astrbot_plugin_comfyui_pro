@@ -46,17 +46,43 @@ def create_app(
     # 保存清理历史记录的函数引用
     _cleanup_history = cleanup_history_func
 
+    def _load_workflow_params() -> Dict[str, object]:
+        try:
+            data = json.loads(meta_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("workflow_params"), dict):
+                return data["workflow_params"]
+        except Exception:
+            pass
+        return {}
+
+    def _save_workflow_params(params: Dict[str, object]) -> None:
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        existing: Dict[str, object] = {}
+        if meta_path.exists():
+            try:
+                data = json.loads(meta_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    existing = dict(data)
+            except Exception:
+                pass
+        existing["workflow_params"] = params
+        meta_path.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+
     async def list_handler(_: web.Request) -> web.Response:
         """GET /api/list：列出 workflows 目录下所有 .json 及备注。"""
         meta = load_meta()
+        workflow_params = _load_workflow_params()
         files = []
         if workflows_dir.exists():
             for f in sorted(workflows_dir.glob("*.json")):
                 name = f.name
+                params = workflow_params.get(name, {}) if isinstance(workflow_params, dict) else {}
+                display_name = params.get("name") if isinstance(params, dict) else ""
                 files.append({
                     "filename": name,
-                    "name": (parse_workflow_filename(name) or {}).get("name", name.removesuffix(".json")),
+                    "name": display_name or (parse_workflow_filename(name) or {}).get("name", name.removesuffix(".json")),
                     "description": meta.get(name, ""),
+                    "params": params,
                 })
         return web.json_response({"files": files})
 
@@ -103,8 +129,31 @@ def create_app(
         if not (workflows_dir / filename).exists():
             return web.json_response({"ok": False, "error": "file not found in workflows"}, status=404)
         meta = load_meta()
-        meta[filename] = description
+        current = meta.get(filename)
+        if isinstance(current, dict):
+            current["short"] = description
+            meta[filename] = current
+        else:
+            meta[filename] = {"short": description, "detailed": str(current or "")}
         save_meta(meta)
+        return web.json_response({"ok": True})
+
+    async def workflow_params_handler(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+        filename = _safe_basename(body.get("filename") or "")
+        params = body.get("params")
+        if not filename or not filename.endswith(".json"):
+            return web.json_response({"ok": False, "error": "invalid filename"}, status=400)
+        if not (workflows_dir / filename).exists():
+            return web.json_response({"ok": False, "error": "file not found in workflows"}, status=404)
+        if not isinstance(params, dict):
+            return web.json_response({"ok": False, "error": "invalid params"}, status=400)
+        all_params = _load_workflow_params()
+        all_params[filename] = params
+        _save_workflow_params(all_params)
         return web.json_response({"ok": True})
 
     async def description_detailed_handler(request: web.Request) -> web.Response:
@@ -149,6 +198,10 @@ def create_app(
         if old_name in meta:
             meta[new_name] = meta.pop(old_name)
             save_meta(meta)
+        workflow_params = _load_workflow_params()
+        if old_name in workflow_params:
+            workflow_params[new_name] = workflow_params.pop(old_name)
+            _save_workflow_params(workflow_params)
         return web.json_response({"ok": True, "filename": new_name})
 
     async def delete_handler(request: web.Request) -> web.Response:
@@ -167,6 +220,9 @@ def create_app(
         meta = load_meta()
         meta.pop(filename, None)
         save_meta(meta)
+        workflow_params = _load_workflow_params()
+        workflow_params.pop(filename, None)
+        _save_workflow_params(workflow_params)
         return web.json_response({"ok": True})
 
     async def clear_cache_handler(request: web.Request) -> web.Response:
@@ -288,10 +344,11 @@ def create_app(
     def _workflow_options() -> List[Dict[str, str]]:
         options: List[Dict[str, str]] = []
         seen = set()
+        workflow_params = _load_workflow_params()
         if workflows_dir.exists():
             for f in sorted(workflows_dir.glob("*.json")):
-                parsed = parse_workflow_filename(f.name)
-                name = (parsed or {}).get("name") or f.stem
+                params = workflow_params.get(f.name, {}) if isinstance(workflow_params, dict) else {}
+                name = (params.get("name") if isinstance(params, dict) else "") or (parse_workflow_filename(f.name) or {}).get("name") or f.stem
                 if name in seen:
                     continue
                 seen.add(name)
@@ -337,6 +394,7 @@ def create_app(
     app.router.add_post("/api/upload", upload_handler)
     app.router.add_post("/api/description", description_handler)
     app.router.add_post("/api/description_detailed", description_detailed_handler)
+    app.router.add_post("/api/workflow_params", workflow_params_handler)
     app.router.add_post("/api/rename", rename_handler)
     app.router.add_post("/api/delete", delete_handler)
     app.router.add_post("/api/clear_cache", clear_cache_handler)
@@ -365,6 +423,14 @@ _INDEX_HTML = """<!DOCTYPE html>
     th { background: #2d2d30; }
     .desc { width: 40%; }
     .desc textarea { width: 100%; min-height: 48px; padding: 6px; background: #3c3c3c; color: #d4d4d4; border: 1px solid #555; border-radius: 4px; resize: vertical; }
+    .params { min-width: 360px; }
+    .workflow-name { width: 100%; margin-bottom: 6px; padding: 5px; background: #3c3c3c; color: #d4d4d4; border: 1px solid #555; border-radius: 4px; }
+    .param-grid { display: grid; grid-template-columns: 42px repeat(3, 1fr); gap: 4px; align-items: center; font-size: 12px; }
+    .param-title { color: #bbb; text-align: right; padding-right: 4px; }
+    .param-item { display: flex; gap: 4px; align-items: center; }
+    .param-count { width: 48px; padding: 4px; background: #3c3c3c; color: #d4d4d4; border: 1px solid #555; border-radius: 4px; }
+    .mode-toggle { min-width: 36px; padding: 4px 6px; border: 1px solid #666; border-radius: 4px; background: #444; color: #ddd; cursor: pointer; }
+    .mode-toggle.strict { background: #714b2a; border-color: #a66b35; color: #ffd7a8; }
     .act { white-space: nowrap; }
     .act button { margin-right: 6px; padding: 4px 10px; cursor: pointer; border: none; border-radius: 4px; font-size: 12px; }
     .btn-save { background: #0e639c; color: #fff; }
@@ -410,7 +476,7 @@ _INDEX_HTML = """<!DOCTYPE html>
   </div>
   <div id="msg"></div>
   <table>
-    <thead><tr><th>文件名</th><th class="desc">说明（供 LLM 选择工作流）</th><th class="act">操作</th></tr></thead>
+    <thead><tr><th>文件名</th><th class="params">参数配置</th><th class="desc">说明（供 LLM 选择工作流）</th><th>详细说明</th><th class="act">操作</th></tr></thead>
     <tbody id="list"></tbody>
   </table>
   <script>
@@ -428,6 +494,52 @@ _INDEX_HTML = """<!DOCTYPE html>
     let workflowOptions = [];
     let portState = [];
     const escapeHtml = (value) => String(value || '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    const normalizeRule = (rule) => ({
+      limit: rule && rule.limit !== undefined && rule.limit !== null ? rule.limit : '',
+      mode: rule && rule.mode === 'strict' ? 'strict' : 'loose',
+    });
+    const renderRule = (params, group, key, label) => {
+      const rule = normalizeRule(params?.[group]?.[key]);
+      const strict = rule.mode === 'strict';
+      return `
+        <div class="param-item" data-group="${group}" data-key="${key}">
+          <span>${label}</span>
+          <input class="param-count" type="number" min="0" value="${escapeHtml(rule.limit)}" placeholder="任意">
+          <button type="button" class="mode-toggle ${strict ? 'strict' : ''}" data-mode="${rule.mode}">${strict ? '强' : '弱'}</button>
+        </div>
+      `;
+    };
+    const renderWorkflowParams = (file) => {
+      const params = file.params || {};
+      return `
+        <input class="workflow-name" value="${escapeHtml(params.name || file.name || '')}" placeholder="工作流显示名称">
+        <div class="param-grid">
+          <div></div><div>文本</div><div>图片</div><div>视频</div>
+          <div class="param-title">输入</div>
+          ${renderRule(params, 'inputs', 'text', '')}
+          ${renderRule(params, 'inputs', 'image', '')}
+          ${renderRule(params, 'inputs', 'video', '')}
+          <div class="param-title">输出</div>
+          ${renderRule(params, 'outputs', 'text', '')}
+          ${renderRule(params, 'outputs', 'image', '')}
+          ${renderRule(params, 'outputs', 'video', '')}
+        </div>
+      `;
+    };
+    const collectWorkflowParams = (row) => {
+      const params = { name: row.querySelector('.workflow-name')?.value.trim() || '', inputs: {}, outputs: {} };
+      row.querySelectorAll('.param-item').forEach(item => {
+        const group = item.dataset.group;
+        const key = item.dataset.key;
+        const raw = item.querySelector('.param-count')?.value;
+        const mode = item.querySelector('.mode-toggle')?.dataset.mode || 'loose';
+        params[group][key] = {
+          limit: raw === '' ? null : Math.max(0, parseInt(raw, 10) || 0),
+          mode,
+        };
+      });
+      return params;
+    };
     const isAllWorkflows = (port) => !port.workflows || port.workflows.length === 0;
     const renderPorts = () => {
       const root = document.getElementById('portsList');
@@ -508,7 +620,8 @@ _INDEX_HTML = """<!DOCTYPE html>
       tbody.innerHTML = files.map(f => `
         <tr data-filename="${f.filename.replace(/"/g, '&quot;')}">
           <td>${f.filename}</td>
-          <td class="desc"><textarea rows="2" placeholder="简要说明（50字内），供 LLM 选择" maxlength="50">${(f.description?.short || '').replace(/</g, '&lt;')}</textarea></td>
+          <td class="params">${renderWorkflowParams(f)}</td>
+          <td class="desc"><textarea rows="2" placeholder="简要说明，供 LLM 选择">${(f.description?.short || '').replace(/</g, '&lt;')}</textarea></td>
           <td class="desc-detailed"><textarea rows="4" placeholder="详细说明，不限制字数，供 comfyui_get_workflow_detail 查询">${(f.description?.detailed || '').replace(/</g, '&lt;')}</textarea></td>
           <td class="act">
             <button class="btn-save">保存说明</button>
@@ -517,16 +630,27 @@ _INDEX_HTML = """<!DOCTYPE html>
           </td>
         </tr>
       `).join('');
+      tbody.querySelectorAll('.mode-toggle').forEach(btn => {
+        btn.onclick = () => {
+          const strict = btn.dataset.mode !== 'strict';
+          btn.dataset.mode = strict ? 'strict' : 'loose';
+          btn.textContent = strict ? '强' : '弱';
+          btn.classList.toggle('strict', strict);
+        };
+      });
       tbody.querySelectorAll('.btn-save').forEach(btn => {
         btn.onclick = async () => {
           const row = btn.closest('tr');
           const filename = row.dataset.filename;
           const description = row.querySelector('td.desc textarea').value;
           const detailed = row.querySelector('td.desc-detailed textarea').value;
+          const params = collectWorkflowParams(row);
           try { 
             await api('/api/description', { filename, description }); 
             await api('/api/description_detailed', { filename, description: detailed }); 
+            await api('/api/workflow_params', { filename, params });
             msg('已保存说明', true); 
+            await loadPorts();
           } catch (e) { msg(e.message, false); }
         };
       });

@@ -17,82 +17,96 @@ from astrbot.api import logger
 
 def parse_workflow_filename(filename: str) -> Optional[Dict[str, Any]]:
     """
-    解析工作流文件名，提取工作流名称和所需参数。
-    格式示例：手办化+图片1.json, abc+文本2+图片2.json, 反推+图片1=文本1.json
+    解析工作流文件名，仅提取默认工作流名称。
+    输入/输出参数由 WebUI 的 workflow_params 配置，不再从文件名解析。
     """
     if not filename.endswith(".json"):
         return None
-    base_name = filename[:-5]
-    output_texts = 0
-    if "=" in base_name:
-        parts_with_output = base_name.split("=")
-        if len(parts_with_output) == 2:
-            output_part = parts_with_output[1]
-            if output_part.startswith("文本"):
-                num_str = output_part[2:]
-                if num_str.isdigit():
-                    output_texts = int(num_str)
-                    base_name = parts_with_output[0]
-                else:
-                    return None
-            else:
-                return None
-        else:
-            return None
-    parts = base_name.split("+")
-    if not parts:
+    return _build_workflow_info(filename, None)
+
+
+def _normalize_limit(value: Any) -> Optional[int]:
+    if value is None or value == "":
         return None
-    name = parts[0]
-    texts = images = videos = 0
-    seen_text = seen_image = seen_video = False
-    for part in parts[1:]:
-        if part.startswith("文本"):
-            if seen_text:
-                return None
-            num_str = part[2:]
-            if not num_str.isdigit():
-                return None
-            texts = int(num_str)
-            seen_text = True
-        elif part.startswith("图片"):
-            if seen_image:
-                return None
-            num_str = part[2:]
-            if not num_str.isdigit():
-                return None
-            images = int(num_str)
-            seen_image = True
-        elif part.startswith("视频"):
-            if seen_video:
-                return None
-            num_str = part[2:]
-            if not num_str.isdigit():
-                return None
-            videos = int(num_str)
-            seen_video = True
-        else:
-            return None
-    result = {
-        "name": name,
-        "texts": texts,
-        "images": images,
-        "videos": videos,
-        "filename": filename,
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0, number)
+
+
+def _normalize_mode(value: Any) -> str:
+    return "strict" if value == "strict" else "loose"
+
+
+def _normalize_rule(raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        raw = {}
+    return {
+        "limit": _normalize_limit(raw.get("limit")),
+        "mode": _normalize_mode(raw.get("mode")),
     }
-    if output_texts > 0:
-        result["output_texts"] = output_texts
-    return result
 
 
-def list_workflows_in_dir(workflow_dir: Path) -> List[Dict[str, Any]]:
+def _normalize_workflow_params(raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        raw = {}
+    inputs = raw.get("inputs") if isinstance(raw.get("inputs"), dict) else {}
+    outputs = raw.get("outputs") if isinstance(raw.get("outputs"), dict) else {}
+    return {
+        "name": str(raw.get("name") or "").strip(),
+        "inputs": {
+            "text": _normalize_rule(inputs.get("text")),
+            "image": _normalize_rule(inputs.get("image")),
+            "video": _normalize_rule(inputs.get("video")),
+        },
+        "outputs": {
+            "text": _normalize_rule(outputs.get("text")),
+            "image": _normalize_rule(outputs.get("image")),
+            "video": _normalize_rule(outputs.get("video")),
+        },
+    }
+
+
+def _build_workflow_info(filename: str, params: Any = None) -> Dict[str, Any]:
+    normalized = _normalize_workflow_params(params)
+    name = normalized.get("name") or Path(filename).stem
+    return {
+        "name": name,
+        "texts": normalized["inputs"]["text"]["limit"],
+        "images": normalized["inputs"]["image"]["limit"],
+        "videos": normalized["inputs"]["video"]["limit"],
+        "output_texts": normalized["outputs"]["text"]["limit"],
+        "output_images": normalized["outputs"]["image"]["limit"],
+        "output_videos": normalized["outputs"]["video"]["limit"],
+        "filename": filename,
+        "params": normalized,
+    }
+
+
+def _input_rule_matches(count: int, rule: Dict[str, Any]) -> bool:
+    limit = rule.get("limit")
+    if limit is None:
+        return True
+    if rule.get("mode") == "strict":
+        return count == limit
+    return True
+
+
+def _input_match_score(count: int, rule: Dict[str, Any]) -> int:
+    limit = rule.get("limit")
+    if limit is None:
+        return 0
+    return abs(count - limit)
+
+
+def list_workflows_in_dir(workflow_dir: Path, workflow_params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """扫描指定目录下的 .json 工作流，返回可解析的工作流信息列表。"""
     workflows = []
     if not workflow_dir.exists():
         return workflows
     for f in workflow_dir.glob("*.json"):
-        info = parse_workflow_filename(f.name)
-        if info:
-            workflows.append(info)
+        workflows.append(_build_workflow_info(f.name, (workflow_params or {}).get(f.name)))
     return workflows
 
 
@@ -102,18 +116,28 @@ def find_workflow_file(
     image_count: int,
     video_count: int,
     workflow_dir: Path,
+    workflow_params: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """根据工作流名称和参数数量在指定目录中查找最佳匹配的工作流文件路径。"""
     if not workflow_dir.exists():
         return None
     candidates = []
     for f in workflow_dir.glob("*.json"):
-        info = parse_workflow_filename(f.name)
+        info = _build_workflow_info(f.name, (workflow_params or {}).get(f.name))
         if not info or info["name"] != workflow_name:
             continue
-        rt, ri, rv = info["texts"], info["images"], info.get("videos", 0)
-        if text_count <= rt and image_count >= ri and video_count >= rv:
-            score = abs(text_count - rt) + abs(image_count - ri) + abs(video_count - rv)
+        params = info.get("params") or {}
+        inputs = params.get("inputs") or {}
+        if (
+            _input_rule_matches(text_count, inputs.get("text", {}))
+            and _input_rule_matches(image_count, inputs.get("image", {}))
+            and _input_rule_matches(video_count, inputs.get("video", {}))
+        ):
+            score = (
+                _input_match_score(text_count, inputs.get("text", {}))
+                + _input_match_score(image_count, inputs.get("image", {}))
+                + _input_match_score(video_count, inputs.get("video", {}))
+            )
             candidates.append({"file": str(f), "score": score})
     if not candidates:
         return None

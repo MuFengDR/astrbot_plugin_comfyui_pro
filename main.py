@@ -147,7 +147,7 @@ def _load_workflow_meta() -> Dict[str, Any]:
             for k, v in descriptions.items():
                 if isinstance(v, str):
                     # 旧格式，转为新格式
-                    result[k] = {"short": v[:50] if len(v) > 50 else v, "detailed": v}
+                    result[k] = {"short": v, "detailed": v}
                 elif isinstance(v, dict):
                     result[k] = v
                 else:
@@ -175,6 +175,54 @@ def _load_workflow_text_slots() -> Dict[str, List[str]]:
         return {k: v if isinstance(v, list) else [] for k, v in raw.items()}
     except Exception:
         return {}
+
+
+def _load_workflow_params() -> Dict[str, Any]:
+    if not META_PATH.exists():
+        return {}
+    try:
+        data = json.loads(META_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        raw = data.get("workflow_params")
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _list_workflows_in_configured_dir(workflow_dir: Path) -> List[Dict[str, Any]]:
+    return list_workflows_in_dir(workflow_dir, _load_workflow_params())
+
+
+def _get_configured_workflow_info(workflow_dir: Path, filename: str, workflow_params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    for item in list_workflows_in_dir(workflow_dir, workflow_params or _load_workflow_params()):
+        if item.get("filename") == filename:
+            return item
+    return None
+
+
+def _apply_input_rule(values: List[Any], rule: Dict[str, Any], label: str) -> tuple[bool, List[Any], str]:
+    limit = rule.get("limit") if isinstance(rule, dict) else None
+    mode = rule.get("mode") if isinstance(rule, dict) else "loose"
+    if limit is None:
+        return True, values, ""
+    limit = max(0, int(limit))
+    count = len(values)
+    if mode == "strict" and count != limit:
+        return False, values, f"{label}需要 {limit} 个，当前提供 {count} 个。"
+    if mode != "strict" and count > limit:
+        return True, values[:limit], ""
+    return True, values, ""
+
+
+def _apply_workflow_input_rules(info: Dict[str, Any], texts: List[str], images: List[str], videos: List[str]) -> tuple[bool, List[str], List[str], List[str], str]:
+    params = info.get("params") if isinstance(info.get("params"), dict) else {}
+    inputs = params.get("inputs") if isinstance(params.get("inputs"), dict) else {}
+    ok_texts, texts, msg_texts = _apply_input_rule(texts, inputs.get("text", {}), "文本")
+    ok_images, images, msg_images = _apply_input_rule(images, inputs.get("image", {}), "图片")
+    ok_videos, videos, msg_videos = _apply_input_rule(videos, inputs.get("video", {}), "视频")
+    messages = [m for m in (msg_texts, msg_images, msg_videos) if m]
+    return ok_texts and ok_images and ok_videos, texts, images, videos, " ".join(messages)
 
 
 async def _load_workflow_descriptions(config: Any) -> Dict[str, str]:
@@ -557,7 +605,7 @@ def _get_comfyui_output_image_dir() -> Path:
 async def _save_image_to_persistent_path(temp_path: str, session_key: str) -> Optional[str]:
     """
     将临时图片复制到持久化目录，返回绝对路径。
-    保存路径会出现在消息文本中（ComfyUI 图片路径: xxx），qts_get_recent_messages 返回的 content 可解析该路径供下一轮 image_urls 使用。
+    保存路径用于插件内部复用与发送，不主动暴露到聊天文本中。
     """
     if not temp_path or not Path(temp_path).exists():
         return None
@@ -797,8 +845,36 @@ async def _estimate_remaining_seconds(server_ip: str, prompt_id: str) -> int:
     return 0
 
 
-async def _get_result_for_prompt(server_ip: str, prompt_id: str, max_texts: int = 0) -> tuple:
-    """任务已完成时，从 history 拉取结果。返回 (file_url, file_type, text_outputs)。"""
+def _normalize_output_rules_arg(output_rules: Any) -> Dict[str, Dict[str, Any]]:
+    if isinstance(output_rules, int):
+        return {
+            "text": {"limit": output_rules, "mode": "loose"},
+            "image": {"limit": None, "mode": "loose"},
+            "video": {"limit": None, "mode": "loose"},
+        }
+    if not isinstance(output_rules, dict):
+        output_rules = {}
+    return {
+        "text": output_rules.get("text", {}) if isinstance(output_rules.get("text"), dict) else {},
+        "image": output_rules.get("image", {}) if isinstance(output_rules.get("image"), dict) else {},
+        "video": output_rules.get("video", {}) if isinstance(output_rules.get("video"), dict) else {},
+    }
+
+
+def _apply_output_rule(values: List[Any], rule: Dict[str, Any], label: str) -> tuple[bool, List[Any], str]:
+    limit = rule.get("limit") if isinstance(rule, dict) else None
+    mode = rule.get("mode") if isinstance(rule, dict) else "loose"
+    if limit is None:
+        return True, values, ""
+    limit = max(0, int(limit))
+    count = len(values)
+    if mode == "strict" and count < limit:
+        return False, values, f"{label}至少需要输出 {limit} 个，实际输出 {count} 个。"
+    return True, values[:limit], ""
+
+
+async def _get_result_for_prompt(server_ip: str, prompt_id: str, output_rules: Any = None) -> tuple:
+    """任务已完成时，从 history 拉取结果。返回 (media_outputs, file_type, text_outputs)。"""
     base = _get_comfyui_http_base(server_ip)
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -809,7 +885,11 @@ async def _get_result_for_prompt(server_ip: str, prompt_id: str, max_texts: int 
     if prompt_id not in info or "outputs" not in info[prompt_id]:
         return None, "unknown", []
     outputs = info[prompt_id]["outputs"]
-    texts = _extract_history_text_outputs(outputs, max_texts)
+    rules = _normalize_output_rules_arg(output_rules)
+    texts = _extract_history_text_outputs(outputs, None)
+    images: List[str] = []
+    videos: List[str] = []
+    audios: List[str] = []
     for key in outputs:
         out = outputs[key]
         if isinstance(out, dict) and "audio" in out:
@@ -817,26 +897,40 @@ async def _get_result_for_prompt(server_ip: str, prompt_id: str, max_texts: int 
                 if audio.get("type") == "output":
                     fn, sub = audio["filename"], audio.get("subfolder", "")
                     url = f"{base}/view?filename={fn}&subfolder={sub}&type=output" if sub else f"{base}/view?filename={fn}&type=output"
-                    return url, "audio", texts
+                    audios.append(url)
         if isinstance(out, dict) and "gifs" in out:
             for video in out["gifs"]:
                 if video.get("type") == "output":
                     fn, sub = video["filename"], video.get("subfolder", "")
                     url = f"{base}/view?filename={fn}&subfolder={sub}&type=output" if sub else f"{base}/view?filename={fn}&type=output"
-                    return url, "video", texts
+                    videos.append(url)
         if isinstance(out, dict) and "images" in out:
             for img in out["images"]:
                 if img.get("type") == "output":
                     fn, sub = img["filename"], img.get("subfolder", "")
                     url = f"{base}/view?filename={fn}&subfolder={sub}&type=output" if sub else f"{base}/view?filename={fn}&type=output"
-                    return url, "image", texts
-    return None, "unknown", texts
+                    images.append(url)
+    ok_texts, texts, msg_texts = _apply_output_rule(texts, rules.get("text", {}), "文本")
+    ok_images, images, msg_images = _apply_output_rule(images, rules.get("image", {}), "图片")
+    ok_videos, videos, msg_videos = _apply_output_rule(videos, rules.get("video", {}), "视频")
+    messages = [m for m in (msg_texts, msg_images, msg_videos) if m]
+    if not (ok_texts and ok_images and ok_videos):
+        return None, "error", messages
+    media = {"images": images, "videos": videos, "audio": audios}
+    media_count = len(images) + len(videos) + len(audios)
+    if media_count == 0:
+        return None, "text" if texts else "unknown", texts
+    if len(images) and not videos and not audios:
+        return media, "image", texts
+    if len(videos) and not images and not audios:
+        return media, "video", texts
+    if len(audios) and not images and not videos:
+        return media, "audio", texts
+    return media, "mixed", texts
 
 
-def _extract_history_text_outputs(outputs: Any, max_texts: int = 0) -> List[str]:
+def _extract_history_text_outputs(outputs: Any, max_texts: Optional[int] = None) -> List[str]:
     texts: List[str] = []
-    if max_texts <= 0:
-        return texts
     if not isinstance(outputs, dict):
         return texts
     for out in outputs.values():
@@ -853,7 +947,7 @@ def _extract_history_text_outputs(outputs: Any, max_texts: int = 0) -> List[str]
             text = str(item or "").strip()
             if text:
                 texts.append(text)
-                if len(texts) >= max_texts:
+                if max_texts is not None and len(texts) >= max_texts:
                     return texts
     return texts
 
@@ -1034,10 +1128,43 @@ async def _append_completed_task_result(
     prompt_id: str,
     task_server_ip: str,
     task_session_key: str,
-    url: Optional[str],
+    url: Any,
     ftype: str,
     texts: List[str],
 ) -> None:
+    if ftype == "error":
+        results.append(
+            {
+                "task_id": prompt_id,
+                "status": "error",
+                "type": "error",
+                "message": "\n".join(texts) if texts else "ComfyUI 输出数量不匹配。",
+            }
+        )
+        return
+    if isinstance(url, dict):
+        images = [str(u) for u in (url.get("images") or []) if u]
+        videos = [str(u) for u in (url.get("videos") or []) if u]
+        audios = [str(u) for u in (url.get("audio") or []) if u]
+        if images:
+            _session_image_url_queue.setdefault(task_session_key, []).extend(images)
+        if videos:
+            _session_video_url_queue.setdefault(task_session_key, []).extend(videos)
+        results.append(
+            {
+                "task_id": prompt_id,
+                "status": "completed",
+                "type": ftype,
+                "image_count": len(images),
+                "video_count": len(videos),
+                "audio_count": len(audios),
+                "texts": texts,
+                "description": "\n\n".join(texts).strip(),
+                "auto_sent": bool(videos),
+                "delivery": "queued_by_plugin" if videos else "",
+            }
+        )
+        return
     if not url:
         results.append(
             {
@@ -1115,7 +1242,8 @@ async def _submit_comfyui_workflow(
     active_port = _get_active_comfyui_port(config)
     server_ip, client_id = _get_server_config(config)
     wf_dir = _get_workflow_dir()
-    all_workflows = list_workflows_in_dir(wf_dir)
+    workflow_params = _load_workflow_params()
+    all_workflows = list_workflows_in_dir(wf_dir, workflow_params)
     workflows = _filter_workflows_for_port(all_workflows, active_port)
     if any(w["name"] == workflow_name for w in all_workflows) and not any(w["name"] == workflow_name for w in workflows):
         available = sorted({w["name"] for w in workflows})
@@ -1136,16 +1264,14 @@ async def _submit_comfyui_workflow(
             logger.info("[ComfyUI Tool] Injected %d image(s) from image_urls placeholder (URL or local path).", len(from_sources))
 
     workflow_file = find_workflow_file(
-        workflow_name, len(texts), len(images_b64), len(videos), wf_dir
+        workflow_name, len(texts), len(images_b64), len(videos), wf_dir, workflow_params
     )
     if not workflow_file:
         matching_names = [w for w in workflows if w["name"] == workflow_name]
         if matching_names:
             required = []
             for w in matching_names:
-                info = parse_workflow_filename(w["filename"])
-                if info:
-                    required.append(f"'{w['filename']}'（最多 文本{info['texts']}，需要 图片{info['images']}，视频{info.get('videos', 0)}）")
+                required.append(f"'{w['filename']}'（{_format_workflow_required_params(w)}）")
             if required:
                 return {
                     "ok": False,
@@ -1170,9 +1296,9 @@ async def _submit_comfyui_workflow(
             ),
         }
 
-    info = parse_workflow_filename(Path(workflow_file).name)
+    info = _get_configured_workflow_info(wf_dir, Path(workflow_file).name, workflow_params)
     if not info:
-        return {"ok": False, "message": "工作流文件名格式错误，无法解析所需参数。请按「工作流名+文本N+图片M+视频K.json」命名。"}
+        return {"ok": False, "message": "工作流配置不可用，无法解析输入输出参数。请在工作流管理页保存该工作流的参数配置。"}
 
     wf_filename = Path(workflow_file).name
     descriptions = await _load_workflow_descriptions(config)
@@ -1187,18 +1313,14 @@ async def _submit_comfyui_workflow(
             f"\n\n[工作流「{workflow_name}」说明：{workflow_desc}]"
         )
 
-    if len(texts) > info["texts"] or len(images_b64) < info["images"] or len(videos) < info.get("videos", 0):
-        hint = ""
-        if len(images_b64) < info["images"] and len(images_b64) == 0:
-            hint = " 当前消息没有图片，请提供图片附件或 image_urls。"
-        if len(texts) > info["texts"]:
-            hint += f" 文本最多只能提供 {info['texts']} 条，当前提供 {len(texts)} 条。"
+    ok_inputs, texts, images_b64, videos, input_error = _apply_workflow_input_rules(info, texts, images_b64, videos)
+    if not ok_inputs:
         return {
             "ok": False,
             "message": (
-                f"工作流「{workflow_name}」最多支持：文本{info['texts']}；至少需要：图片{info['images']}，视频{info.get('videos', 0)}。"
+                f"工作流「{workflow_name}」参数数量不匹配。"
                 f"当前提供：文本{len(texts)}，图片{len(images_b64)}，视频{len(videos)}。"
-                + hint
+                + (" " + input_error if input_error else "")
                 + desc_reminder
             ),
         }
@@ -1209,14 +1331,14 @@ async def _submit_comfyui_workflow(
         workflow.load_workflow_api(workflow_file)
         prompt_id = await workflow.submit_only(images_b64, texts, videos, debug=debug)
         session_key = _get_session_key(context)
-        output_texts = int(info.get("output_texts", 0) or 0)
+        output_rules = (info.get("params") or {}).get("outputs") or {}
         pending_data = {
             "prompt_id": prompt_id,
             "server_ip": server_ip,
             "client_id": client_id,
             "session_key": session_key,
             "session_tag": session_tag,
-            "output_texts": output_texts,
+            "output_rules": output_rules,
         }
         _session_pending[session_key] = pending_data
         if session_key != "default":
@@ -1234,7 +1356,7 @@ async def _submit_comfyui_workflow(
             "client_id": client_id,
             "session_key": session_key,
             "session_tag": session_tag,
-            "output_texts": output_texts,
+            "output_rules": output_rules,
             "desc_reminder": desc_reminder,
             "all_task_ids": list(_session_tag_tasks.get(session_tag, [])),
         }
@@ -1310,17 +1432,29 @@ def _resolve_workflow_selector(selector: str, workflows: List[Dict[str, Any]]) -
 
 
 def _format_workflow_required_params(workflow: Dict[str, Any]) -> str:
-    params = []
-    texts = int(workflow.get("texts", 0) or 0)
-    images = int(workflow.get("images", 0) or 0)
-    videos = int(workflow.get("videos", 0) or 0)
-    if texts:
-        params.append(f"文本{texts}")
-    if images:
-        params.append(f"图片{images}")
-    if videos:
-        params.append(f"视频{videos}")
-    return "、".join(params) if params else "无"
+    def fmt_rule(label: str, rule: Dict[str, Any]) -> str:
+        limit = rule.get("limit") if isinstance(rule, dict) else None
+        mode = "强" if isinstance(rule, dict) and rule.get("mode") == "strict" else "弱"
+        return f"{label}任意" if limit is None else f"{label}{limit}({mode})"
+
+    params = workflow.get("params") if isinstance(workflow.get("params"), dict) else {}
+    inputs = params.get("inputs") if isinstance(params.get("inputs"), dict) else {}
+    outputs = params.get("outputs") if isinstance(params.get("outputs"), dict) else {}
+    in_text = "输入：" + "、".join(
+        [
+            fmt_rule("文本", inputs.get("text", {})),
+            fmt_rule("图片", inputs.get("image", {})),
+            fmt_rule("视频", inputs.get("video", {})),
+        ]
+    )
+    out_text = "输出：" + "、".join(
+        [
+            fmt_rule("文本", outputs.get("text", {})),
+            fmt_rule("图片", outputs.get("image", {})),
+            fmt_rule("视频", outputs.get("video", {})),
+        ]
+    )
+    return f"{in_text}；{out_text}"
 
 
 def _escape_markdown_table_cell(value: Any) -> str:
@@ -1387,10 +1521,12 @@ async def _wait_for_command_result(
     session_key: str,
     session_tag: str,
     timeout: int,
-    max_texts: int = 0,
+    output_rules: Any = None,
 ) -> Dict[str, Any]:
     results: List[Dict[str, Any]] = []
-    url, ftype, texts = await _get_result_for_prompt(server_ip, prompt_id, max_texts)
+    url, ftype, texts = await _get_result_for_prompt(server_ip, prompt_id, output_rules)
+    if ftype == "error":
+        return {"status": "error", "message": "\n".join(texts) if texts else "ComfyUI 输出数量不匹配。"}
     if url:
         _cleanup_completed_task(prompt_id, session_tag)
         await _append_completed_task_result(results, context, prompt_id, server_ip, session_key, url, ftype, texts)
@@ -1401,7 +1537,10 @@ async def _wait_for_command_result(
     status_info = wait_result.get(prompt_id) or {"status": "timeout", "message": f"wait timed out after {timeout} seconds"}
     status = status_info.get("status")
     if status == "completed":
-        url, ftype, texts = await _get_result_for_prompt(server_ip, prompt_id, max_texts)
+        url, ftype, texts = await _get_result_for_prompt(server_ip, prompt_id, output_rules)
+        if ftype == "error":
+            _cleanup_completed_task(prompt_id, session_tag)
+            return {"status": "error", "message": "\n".join(texts) if texts else "ComfyUI 输出数量不匹配。"}
         _cleanup_completed_task(prompt_id, session_tag)
         await _append_completed_task_result(results, context, prompt_id, server_ip, session_key, url, ftype, texts)
         elapsed = await _get_prompt_elapsed_seconds(server_ip, prompt_id)
@@ -1431,11 +1570,20 @@ def _format_command_result(wait_result: Dict[str, Any]) -> str:
         texts = item.get("texts") or []
         text_body = "\n\n".join(str(t).strip() for t in texts if str(t).strip())
         prefix = f"完成{elapsed_text}："
-        if ftype == "image":
+        image_count = int(item.get("image_count", 0) or (1 if ftype == "image" else 0))
+        video_count = int(item.get("video_count", 0) or (1 if ftype == "video" else 0))
+        image_placeholders = COMFYUI_IMAGE_PLACEHOLDER * max(0, image_count)
+        if ftype in ("image", "mixed") and image_count:
             if text_body:
-                return f"{prefix}{text_body}\n\n{COMFYUI_IMAGE_PLACEHOLDER}"
-            return prefix + COMFYUI_IMAGE_PLACEHOLDER
-        if ftype == "video":
+                suffix = f"\n\n{image_placeholders}"
+                if video_count:
+                    suffix += "\n\n视频已发送。"
+                return f"{prefix}{text_body}{suffix}"
+            suffix = image_placeholders
+            if video_count:
+                suffix += "\n\n视频已发送。"
+            return prefix + suffix
+        if ftype == "video" or (ftype == "mixed" and video_count):
             if text_body:
                 return f"{prefix}{text_body}\n\n视频已发送。"
             return f"\u5b8c\u6210{elapsed_text}\uff0c\u89c6\u9891\u5df2\u53d1\u9001\u3002"
@@ -1449,7 +1597,7 @@ def _format_command_result(wait_result: Dict[str, Any]) -> str:
 
 
 async def _wait_for_completion(
-    server_ip: str, client_id: str, prompt_id: str, timeout: int = 600, max_texts: int = 0
+    server_ip: str, client_id: str, prompt_id: str, timeout: int = 600, output_rules: Any = None
 ) -> tuple:
     """
     轮询直到任务完成，返回 (file_url, file_type, text_outputs)。
@@ -1469,37 +1617,7 @@ async def _wait_for_completion(
         except Exception:
             pass
         await asyncio.sleep(2)
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            hist = await client.get(f"{base}/history/{prompt_id}")
-            info = hist.json()
-    except Exception:
-        return None, "unknown", []
-    if prompt_id not in info or "outputs" not in info[prompt_id]:
-        return None, "unknown", []
-    outputs = info[prompt_id]["outputs"]
-    texts = _extract_history_text_outputs(outputs, max_texts)
-    for key in outputs:
-        out = outputs[key]
-        if isinstance(out, dict) and "audio" in out:
-            for audio in out["audio"]:
-                if audio.get("type") == "output":
-                    fn, sub = audio["filename"], audio.get("subfolder", "")
-                    url = f"{base}/view?filename={fn}&subfolder={sub}&type=output" if sub else f"{base}/view?filename={fn}&type=output"
-                    return url, "audio", texts
-        if isinstance(out, dict) and "gifs" in out:
-            for video in out["gifs"]:
-                if video.get("type") == "output":
-                    fn, sub = video["filename"], video.get("subfolder", "")
-                    url = f"{base}/view?filename={fn}&subfolder={sub}&type=output" if sub else f"{base}/view?filename={fn}&type=output"
-                    return url, "video", texts
-        if isinstance(out, dict) and "images" in out:
-            for img in out["images"]:
-                if img.get("type") == "output":
-                    fn, sub = img["filename"], img.get("subfolder", "")
-                    url = f"{base}/view?filename={fn}&subfolder={sub}&type=output" if sub else f"{base}/view?filename={fn}&type=output"
-                    return url, "image", texts
-    return None, "unknown", texts
+    return await _get_result_for_prompt(server_ip, prompt_id, output_rules)
 
 
 async def _extract_images_from_event_async(event: Any) -> List[str]:
@@ -1759,7 +1877,7 @@ class ComfyUIListWorkflowsTool(FunctionTool[AstrAgentContext]):
         descriptions = await _load_workflow_descriptions(config)
         text_slots = _load_workflow_text_slots()
         wf_dir = _get_workflow_dir()
-        workflows = _filter_workflows_for_port(list_workflows_in_dir(wf_dir), active_port)
+        workflows = _filter_workflows_for_port(_list_workflows_in_configured_dir(wf_dir), active_port)
         if not workflows:
             return f"当前 ComfyUI 来源「{active_port['name']}」没有可用工作流。请使用 /comfyuiport 切换来源，或调整该来源的可用工作流配置。"
         
@@ -1778,7 +1896,7 @@ class ComfyUIListWorkflowsTool(FunctionTool[AstrAgentContext]):
             slot_info = ""
             if slots:
                 slot_info = f" | Text slots: {', '.join(slots)}"
-            lines.append(f"- {name}: {short_desc}{slot_info}")
+            lines.append(f"- {name}: {short_desc} | {_format_workflow_required_params(w)}{slot_info}")
         
         return "\n".join(lines)
 
@@ -1818,7 +1936,7 @@ class ComfyUIGetWorkflowDetailTool(FunctionTool[AstrAgentContext]):
         descriptions = await _load_workflow_descriptions(config)
         text_slots = _load_workflow_text_slots()
         wf_dir = _get_workflow_dir()
-        workflows = _filter_workflows_for_port(list_workflows_in_dir(wf_dir), active_port)
+        workflows = _filter_workflows_for_port(_list_workflows_in_configured_dir(wf_dir), active_port)
         
         # 查找对应的工作流
         target_wf = None
@@ -1844,6 +1962,7 @@ class ComfyUIGetWorkflowDetailTool(FunctionTool[AstrAgentContext]):
         
         result = f"Workflow: {workflow_name}\n"
         result += f"Filename: {filename}\n"
+        result += f"Params: {_format_workflow_required_params(target_wf)}\n"
         result += f"Short description: {short_desc or '(无)'}\n"
         result += f"Detailed description: {detailed_desc or '(无)'}\n"
         if slots:
@@ -1880,14 +1999,24 @@ class ComfyUIStatusTool(FunctionTool[AstrAgentContext]):
         session_key = _get_session_key(context.context)
         pending = _session_pending.get(session_key) or _session_pending.get("default")
         if pending and pending.get("prompt_id") and server_ip:
-            output_texts = int(pending.get("output_texts", 0) or 0)
+            output_rules = pending.get("output_rules")
             remaining = await _estimate_remaining_seconds(server_ip, pending["prompt_id"])
             if remaining == 0:
-                url, ftype, texts = await _get_result_for_prompt(server_ip, pending["prompt_id"], output_texts)
+                url, ftype, texts = await _get_result_for_prompt(server_ip, pending["prompt_id"], output_rules)
                 for k in list(_session_pending.keys()):
                     if _session_pending.get(k) == pending:
                         _session_pending.pop(k, None)
                 _task_registry.pop(pending.get("prompt_id"), None)
+                if isinstance(url, dict):
+                    images = url.get("images") or []
+                    videos = url.get("videos") or []
+                    if images:
+                        _session_image_url_queue.setdefault(session_key, []).extend(images)
+                    if videos:
+                        _session_video_url_queue.setdefault(session_key, []).extend(videos)
+                    placeholders = COMFYUI_IMAGE_PLACEHOLDER * len(images)
+                    video_text = " Video is queued for automatic sending." if videos else ""
+                    return f"Task completed. Output: {ftype}. {placeholders}{video_text} Queue: 0 running, 0 pending."
                 if url:
                     if ftype == "image":
                         if _is_local_image_url(url, server_ip):
@@ -1911,12 +2040,22 @@ class ComfyUIStatusTool(FunctionTool[AstrAgentContext]):
             if remaining < wait_threshold:
                 client_id = pending.get("client_id", "")
                 url, ftype, texts = await _wait_for_completion(
-                    server_ip, client_id, pending["prompt_id"], timeout=remaining + 120, max_texts=output_texts
+                    server_ip, client_id, pending["prompt_id"], timeout=remaining + 120, output_rules=output_rules
                 )
                 for k in list(_session_pending.keys()):
                     if _session_pending.get(k) == pending:
                         _session_pending.pop(k, None)
                 _task_registry.pop(pending.get("prompt_id"), None)
+                if isinstance(url, dict):
+                    images = url.get("images") or []
+                    videos = url.get("videos") or []
+                    if images:
+                        _session_image_url_queue.setdefault(session_key, []).extend(images)
+                    if videos:
+                        _session_video_url_queue.setdefault(session_key, []).extend(videos)
+                    placeholders = COMFYUI_IMAGE_PLACEHOLDER * len(images)
+                    video_text = " Video is queued for automatic sending." if videos else ""
+                    return f"Task completed. Output: {ftype}. {placeholders}{video_text} Queue: 0 running, 0 pending."
                 if url:
                     if ftype == "image":
                         if _is_local_image_url(url, server_ip):
@@ -2071,16 +2210,16 @@ class ComfyUIQueryWaitTool(FunctionTool[AstrAgentContext]):
             task_session_tag = pending.get("session_tag", "")
             prompt_id = pending.get("prompt_id")
             task_server_ip = pending.get("server_ip") or server_ip
-            output_texts = int(pending.get("output_texts", 0) or 0)
+            output_rules = pending.get("output_rules")
             task_client_id = pending.get("client_id") or client_id_cfg
-            output_texts = int(pending.get("output_texts", 0) or 0)
+            output_rules = pending.get("output_rules")
 
             if not prompt_id or not task_server_ip:
                 results.append({"task_id": task_id, "status": "error", "message": "invalid task data"})
                 continue
 
-            url, ftype, texts = await _get_result_for_prompt(task_server_ip, prompt_id, output_texts)
-            if url:
+            url, ftype, texts = await _get_result_for_prompt(task_server_ip, prompt_id, output_rules)
+            if url or ftype in ("text", "error"):
                 _cleanup_completed_task(prompt_id, task_session_tag)
                 await _append_completed_task_result(
                     results,
@@ -2122,7 +2261,7 @@ class ComfyUIQueryWaitTool(FunctionTool[AstrAgentContext]):
                     "client_id": task_client_id,
                     "session_key": task_session_key,
                     "session_tag": task_session_tag,
-                    "output_texts": output_texts,
+                    "output_rules": output_rules,
                 }
             )
 
@@ -2155,7 +2294,7 @@ class ComfyUIQueryWaitTool(FunctionTool[AstrAgentContext]):
                 prompt_id = item["prompt_id"]
                 status = wait_result.get("status")
                 if status == "completed":
-                    url, ftype, texts = await _get_result_for_prompt(item["server_ip"], prompt_id, int(item.get("output_texts", 0) or 0))
+                    url, ftype, texts = await _get_result_for_prompt(item["server_ip"], prompt_id, item.get("output_rules"))
                     _cleanup_completed_task(prompt_id, item["session_tag"])
                     await _append_completed_task_result(
                         results,
@@ -2185,8 +2324,8 @@ class ComfyUIQueryWaitTool(FunctionTool[AstrAgentContext]):
                         }
                     )
                 else:
-                    url, ftype, texts = await _get_result_for_prompt(item["server_ip"], prompt_id, int(item.get("output_texts", 0) or 0))
-                    if url:
+                    url, ftype, texts = await _get_result_for_prompt(item["server_ip"], prompt_id, item.get("output_rules"))
+                    if url or ftype in ("text", "error"):
                         _cleanup_completed_task(prompt_id, item["session_tag"])
                         await _append_completed_task_result(
                             results,
@@ -2275,7 +2414,7 @@ class ComfyUIQueryWaitTool(FunctionTool[AstrAgentContext]):
             
             if remaining == 0:
                 # 任务完成
-                url, ftype, texts = await _get_result_for_prompt(task_server_ip, prompt_id, output_texts)
+                url, ftype, texts = await _get_result_for_prompt(task_server_ip, prompt_id, output_rules)
                 # 清理
                 for k in list(_session_pending.keys()):
                     if _session_pending.get(k) and _session_pending.get(k).get("prompt_id") == prompt_id:
@@ -2326,7 +2465,7 @@ class ComfyUIQueryWaitTool(FunctionTool[AstrAgentContext]):
             elif remaining < wait_threshold:
                 # 等待时间不长，直接等待完成
                 client_id = pending.get("client_id", "")
-                url, ftype, texts = await _wait_for_completion(task_server_ip, client_id, prompt_id, timeout=remaining + 120, max_texts=output_texts)
+                url, ftype, texts = await _wait_for_completion(task_server_ip, client_id, prompt_id, timeout=remaining + 120, output_rules=output_rules)
                 # 清理
                 for k in list(_session_pending.keys()):
                     if _session_pending.get(k) and _session_pending.get(k).get("prompt_id") == prompt_id:
@@ -2451,7 +2590,7 @@ class ComfyUIExecuteTool(FunctionTool[AstrAgentContext]):
                 "image_urls": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Image source(s) when message has none. To get image from a previous message: prefer qts_get_recent_messages then qts_get_message_detail; content may contain 'ComfyUI 图片路径: /path'—use that path here. Otherwise use HTTP URL or local path (plugin data dir or data/agent/comfyui/input). Do not paste raw base64.",
+                    "description": "Image source(s) when message has none. Prefer HTTP URL or local path (plugin data dir or data/agent/comfyui/input). Do not paste raw base64.",
                 },
                 "session_tag": {
                     "type": "string",
@@ -2523,10 +2662,10 @@ class ComfyUIExecuteTool(FunctionTool[AstrAgentContext]):
             if from_sources:
                 logger.info("[ComfyUI Tool] Injected %d image(s) from image_urls placeholder (URL or local path).", len(from_sources))
         workflow_file = find_workflow_file(
-            workflow_name, len(texts), len(images_b64), len(videos), wf_dir
+            workflow_name, len(texts), len(images_b64), len(videos), wf_dir, _load_workflow_params()
         )
         # 获取工作流列表供错误提示使用
-        workflows = list_workflows_in_dir(wf_dir)
+        workflows = _list_workflows_in_configured_dir(wf_dir)
         
         if not workflow_file:
             # 检查是否有同名工作流但参数不匹配
@@ -2536,9 +2675,7 @@ class ComfyUIExecuteTool(FunctionTool[AstrAgentContext]):
                 # 同名工作流存在，检查参数需求
                 required = []
                 for w in matching_names:
-                    info = parse_workflow_filename(w["filename"])
-                    if info:
-                        required.append(f"'{w['filename']}' (最多 texts={info['texts']}, 需要 images={info['images']}, videos={info.get('videos', 0)})")
+                    required.append(f"'{w['filename']}' ({_format_workflow_required_params(w)})")
                 
                 if required:
                     return (
@@ -2560,9 +2697,9 @@ class ComfyUIExecuteTool(FunctionTool[AstrAgentContext]):
                 "Possible reasons: (1) workflow name typo—use exact name from list; (2) too few texts/images/videos—check required counts; (3) image_urls rejected (URL failed or path outside allowed dir)."
                 + hint
             )
-        info = parse_workflow_filename(Path(workflow_file).name)
+        info = _get_configured_workflow_info(wf_dir, Path(workflow_file).name)
         if not info:
-            return "工作流文件名格式错误，无法解析所需参数。请按「工作流名+文本N+图片M+视频K.json」命名。"
+            return "工作流配置不可用，无法解析输入输出参数。请在工作流管理页保存该工作流的参数配置。"
         wf_filename = Path(workflow_file).name
         descriptions = await _load_workflow_descriptions(config)
         workflow_desc_data = descriptions.get(wf_filename)
@@ -2576,19 +2713,12 @@ class ComfyUIExecuteTool(FunctionTool[AstrAgentContext]):
                 f"\n\n[工作流「{workflow_name}」说明 (下次调用请按此生成 texts): {workflow_desc}"
                 "\n文本须按上述说明填写（如「根据图2的XX修改图1」），不要只传图片内容描述。]"
             )
-        if len(texts) > info["texts"] or len(images_b64) < info["images"] or len(videos) < info.get("videos", 0):
-            hint = ""
-            if len(images_b64) < info["images"] and len(images_b64) == 0:
-                hint = (
-                    " No image in current message. Use image_urls: HTTP URL, or local path under plugin data dir or data/agent/comfyui/input (absolute path)."
-                )
-            if len(texts) > info["texts"]:
-                hint += f" 文本最多只能提供 {info['texts']} 条，当前提供 {len(texts)} 条。"
+        ok_inputs, texts, images_b64, videos, input_error = _apply_workflow_input_rules(info, texts, images_b64, videos)
+        if not ok_inputs:
             return (
-                f"工作流「{workflow_name}」最多支持：文本{info['texts']}；至少需要：图片{info['images']}，视频{info.get('videos', 0)}。"
+                f"工作流「{workflow_name}」参数数量不匹配。"
                 f"当前提供：文本{len(texts)}，图片{len(images_b64)}，视频{len(videos)}。"
-                "请补充文本、图片或视频参数后重试。"
-                + hint
+                + (" " + input_error if input_error else "")
                 + desc_reminder
             )
         try:
@@ -2597,14 +2727,14 @@ class ComfyUIExecuteTool(FunctionTool[AstrAgentContext]):
             workflow.load_workflow_api(workflow_file)
             prompt_id = await workflow.submit_only(images_b64, texts, videos, debug=debug)
             session_key = _get_session_key(context.context)
-            output_texts = int(info.get("output_texts", 0) or 0)
+            output_rules = (info.get("params") or {}).get("outputs") or {}
             pending_data = {
                 "prompt_id": prompt_id,
                 "server_ip": server_ip,
                 "client_id": client_id,
                 "session_key": session_key,
                 "session_tag": session_tag,
-                "output_texts": output_texts,
+                "output_rules": output_rules,
             }
             _session_pending[session_key] = pending_data
             if session_key != "default":
@@ -2739,11 +2869,12 @@ class ComfyUIPlugin(Star):
             _session_image_url_queue.pop(ik, None)
         # 取本会话视频 URL（FIFO）
         vq = _session_video_url_queue.get(session_key) or _session_video_url_queue.get("default")
-        video_url = vq.pop(0) if (vq and len(vq) > 0) else None
+        video_urls = list(vq or [])
         vk = session_key if (session_key and _session_video_url_queue.get(session_key)) else "default"
-        if vq is not None and len(vq) == 0:
+        if vq is not None:
             _session_video_url_queue.pop(vk, None)
-        if not image_url and not video_url:
+        video_url = video_urls[0] if video_urls else None
+        if not image_url and not video_urls:
             return
         temp_path = await _download_image_to_temp(image_url) if image_url else None
         if image_url and (not temp_path or not Path(temp_path).exists()):
@@ -2855,6 +2986,20 @@ class ComfyUIPlugin(Star):
                     "ComfyUI: skip sending video - session_id must be unified_msg_origin (e.g. napcat:GroupMessage:123), got: %s",
                     session_id[:50] if len(session_id) > 50 else session_id,
                 )
+            if session_id and ":" in session_id and len(video_urls) > 1:
+                remaining_urls = video_urls[1:]
+
+                async def _send_remaining_videos_later() -> None:
+                    await asyncio.sleep(0.6)
+                    for next_url in remaining_urls:
+                        next_temp = await _download_media_to_temp(next_url, ".mp4")
+                        if not next_temp or not Path(next_temp).exists():
+                            continue
+                        next_path = await _save_video_to_persistent_path(next_temp, session_key or "") or next_temp
+                        await _send_video_to_session(session_id, next_path)
+                        await asyncio.sleep(0.3)
+
+                asyncio.create_task(_send_remaining_videos_later())
         if new_chain != chain:
             try:
                 chain.clear()
@@ -2900,7 +3045,7 @@ class ComfyUIPlugin(Star):
             yield event.plain_result(f"切换失败：无法保存当前来源配置。{e}")
             return
 
-        workflows = _filter_workflows_for_port(list_workflows_in_dir(_get_workflow_dir()), target)
+        workflows = _filter_workflows_for_port(_list_workflows_in_configured_dir(_get_workflow_dir()), target)
         yield event.plain_result(
             f"已切换 ComfyUI 来源：{target['name']} ({target['http']})\n"
             f"当前可用工作流：{len(workflows)} 个"
@@ -2913,7 +3058,7 @@ class ComfyUIPlugin(Star):
         if msg == "查询" or msg == "list" or msg == "help":
             active_port = _get_active_comfyui_port(self.config or {})
             wf_dir = _get_workflow_dir()
-            workflows = _filter_workflows_for_port(list_workflows_in_dir(wf_dir), active_port)
+            workflows = _filter_workflows_for_port(_list_workflows_in_configured_dir(wf_dir), active_port)
             descriptions = await _load_workflow_descriptions(self.config)
             if not workflows:
                 yield event.plain_result(f"当前 ComfyUI 来源「{active_port['name']}」没有可用工作流。请使用 /comfyuiport 切换来源，或调整该来源的可用工作流配置。")
@@ -2931,7 +3076,8 @@ class ComfyUIPlugin(Star):
                 lines.append(f"> {w['name']}")
                 lines.append("")
                 lines.append("```")
-                lines.extend(_escape_telegram_code_block_text(desc).splitlines())
+                list_desc = f"{desc}\n\n{_format_workflow_required_params(w)}"
+                lines.extend(_escape_telegram_code_block_text(list_desc).splitlines())
                 lines.append("```")
             yield event.plain_result("\n".join(lines))
             return
@@ -2975,7 +3121,7 @@ class ComfyUIPlugin(Star):
         selector, texts = _split_comfyui_command_args(msg)
         active_port = _get_active_comfyui_port(self.config or {})
         wf_dir = _get_workflow_dir()
-        workflows = _filter_workflows_for_port(list_workflows_in_dir(wf_dir), active_port)
+        workflows = _filter_workflows_for_port(_list_workflows_in_configured_dir(wf_dir), active_port)
         workflow_name = _resolve_workflow_selector(selector, workflows)
         if not workflow_name:
             yield event.plain_result("用法：/comfyui list | /comfyui upload | /comfyui <工作流名称或编号> <文本1>|<文本2>")
@@ -3005,6 +3151,6 @@ class ComfyUIPlugin(Star):
             submit["session_key"],
             submit["session_tag"],
             timeout,
-            int(submit.get("output_texts", 0) or 0),
+            submit.get("output_rules"),
         )
         yield event.plain_result(_format_command_result(wait_result))
