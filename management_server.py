@@ -493,7 +493,7 @@ _INDEX_HTML = """<!DOCTYPE html>
     };
     let workflowOptions = [];
     let portState = [];
-    const escapeHtml = (value) => String(value || '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
     const normalizeRule = (rule) => ({
       limit: rule && rule.limit !== undefined && rule.limit !== null ? rule.limit : '',
       mode: rule && rule.mode === 'strict' ? 'strict' : 'loose',
