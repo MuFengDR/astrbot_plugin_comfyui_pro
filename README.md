@@ -144,26 +144,23 @@ LLM 自动调用时，BOT 会：
    | `图生视频_720p.json` | 输入文本弱 2、输入图片强 1、输出视频弱 1 |
    | `反推提示词.json` | 输入图片强 1、输出文本强 1 |
 
-4. **填写说明与 text_slots（推荐）**  
+4. **填写说明（推荐）**  
    - 在工作流管理页为每个文件填写**说明**（或直接编辑 `data/plugin_data/astrbot_plugin_comfyui_pro/workflow_meta.json`）。  
-   - 说明会通过 `comfyui_list_workflows` 返回给 LLM，便于选择合适工作流。  
-   - 若有多段文本，可在 `workflow_meta.json` 中增加 **`text_slots`**，为每个工作流指定各文本槽位的含义（与 Simple String 顺序一致），例如：
+   - 说明会通过 `/comfyui list` 和 `comfyui_list_workflows` 返回，便于用户复制工作流名，也便于 LLM 选择合适工作流。  
+   - 建议把输入/输出要求直接写进说明里，例如需要几段文本、几张图片、输出什么内容等。LLM 工具不会再额外拼接自动生成的参数摘要。
+   - `workflow_meta.json` 中仍会保存说明，例如：
      ```json
      {
        "descriptions": {
          "改图.json": "根据文本修改图片。flux2_klein9B 模型。",
          "双图参考改图.json": "用于将图片1根据图片2和指定的文本要求进行修改。传入的文本须为「根据图2的XX修改图1」之类。"
-       },
-       "text_slots": {
-         "改图.json": ["修改说明"],
-         "文生图.json": ["正面提示词", "负面提示词"]
        }
      }
      ```
 
 ### 4.3 LLM 使用流程建议
 
-1. 调用 **`comfyui_list_workflows`**：获取可用工作流列表、说明及所需参数（文本/图片/视频数量及 text_slots）。  
+1. 调用 **`comfyui_list_workflows`**：获取可用工作流列表与说明，参数要求以说明内容为准。  
 2. 按用户意图选择工作流，若需要图但当前消息无图：先调用 **`get_image_from_context`**（需安装 astrbot_plugin_image_url_base64_to_mcp）获取 URL。  
 3. 调用 **`comfyui_execute`**：传入 `workflow_name`、`texts`、`image_urls`（可选）、`videos`（可选）；图片可从当前消息自动提取，或通过 `image_urls` 传入 URL/本地路径（仅限插件数据目录内）。  
 4. 调用 **`comfyui_query_wait`**：通过 ComfyUI WebSocket 等待任务完成；结果若为图片/视频，插件会自动发送到当前会话。  
@@ -228,7 +225,7 @@ ws://<ComfyUI地址>/ws?clientId=<client_id>
 - **占位符与持久化路径**：发送 ComfyUI 生成的图片/视频时，插件会将其另存到 `data/agent/comfyui/input/`，并通过占位符或自动队列发送给用户。聊天内容中不会主动暴露本地图片/视频路径。
 - **清理本地缓存**：工作流管理页提供「清理本地缓存」按钮，可删除 `data/agent/comfyui/input/` 与插件 `tmp/` 下的文件，防止占用过多磁盘空间。  
 - **base64 不传入 LLM**：优先使用 URL 或本地路径；若图片来源工具返回占位符（如 `base64://ASTRBOT_PLUGIN_CACHE_PENDING`），请将占位符传入 `image_urls`，不要将原始 base64 填入工具参数，以免 base64 进入 LLM 上下文。插件侧已对相关日志脱敏。  
-- 插件数据目录：**`data/plugin_data/astrbot_plugin_comfyui_pro/`**，其中 **`workflows/`** 存放工作流 JSON，**`workflow_meta.json`** 存放说明与 text_slots。
+- 插件数据目录：**`data/plugin_data/astrbot_plugin_comfyui_pro/`**，其中 **`workflows/`** 存放工作流 JSON，**`workflow_meta.json`** 存放说明与参数配置。
 
 ---
 
@@ -236,7 +233,7 @@ ws://<ComfyUI地址>/ws?clientId=<client_id>
 
 | 能力 | 说明 |
 |------|------|
-| **comfyui_list_workflows** | 查询可用工作流及说明、所需文本/图片/视频数量及 text_slots |
+| **comfyui_list_workflows** | 查询可用工作流及说明 |
 | **comfyui_execute** | 提交工作流；支持 texts、image_urls（URL 或允许范围内的本地路径）、videos |
 | **comfyui_query_wait** | 通过 WebSocket 等待任务完成；图片/视频由插件自动发送到会话 |
 | **comfyui_status** | 查询 ComfyUI 队列状态（运行中/等待中数量） |

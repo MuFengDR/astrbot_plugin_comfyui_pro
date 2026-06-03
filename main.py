@@ -1271,14 +1271,16 @@ async def _submit_comfyui_workflow(
         if matching_names:
             required = []
             for w in matching_names:
-                required.append(f"'{w['filename']}'（{_format_workflow_required_params(w)}）")
+                required.append(f"'{w['filename']}'")
             if required:
                 return {
                     "ok": False,
                     "message": (
                         f"工作流「{workflow_name}」存在，但参数数量不匹配。"
                         f"当前提供：文本{len(texts)}，图片{len(images_b64)}，视频{len(videos)}。\n"
-                        "可用版本：\n" + "\n".join(f"- {r}" for r in required)
+                        "同名工作流文件：\n"
+                        + "\n".join(f"- {r}" for r in required)
+                        + "\n请检查工作流说明或在管理页调整参数配置。"
                     ),
                 }
         hint = ""
@@ -1291,7 +1293,7 @@ async def _submit_comfyui_workflow(
             "ok": False,
             "message": (
                 f"没有找到匹配的工作流「{workflow_name}」（当前提供：文本{len(texts)}，图片{len(images_b64)}，视频{len(videos)}）。"
-                "请使用 /comfyui list 或 comfyui_list_workflows 查看可用工作流和所需参数。"
+                "请使用 /comfyui list 或 comfyui_list_workflows 查看可用工作流说明。"
                 + hint
             ),
         }
@@ -1855,10 +1857,10 @@ async def _image_sources_to_base64(sources: List[str]) -> List[str]:
 
 @dataclass
 class ComfyUIListWorkflowsTool(FunctionTool[AstrAgentContext]):
-    """查询当前可用的 ComfyUI 工作流列表及说明、所需参数，供 LLM 选择工作流时使用。"""
+    """查询当前可用的 ComfyUI 工作流列表及说明，供 LLM 选择工作流时使用。"""
 
     name: str = "comfyui_list_workflows"
-    description: str = "列出所有可用的 ComfyUI 工作流名称及详细说明（包括文本参数说明）。"
+    description: str = "列出所有可用的 ComfyUI 工作流名称及说明。参数要求以工作流说明为准。"
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
@@ -1875,7 +1877,6 @@ class ComfyUIListWorkflowsTool(FunctionTool[AstrAgentContext]):
         server_ip, _ = _get_server_config(config)
         active_port = _get_active_comfyui_port(config)
         descriptions = await _load_workflow_descriptions(config)
-        text_slots = _load_workflow_text_slots()
         wf_dir = _get_workflow_dir()
         workflows = _filter_workflows_for_port(_list_workflows_in_configured_dir(wf_dir), active_port)
         if not workflows:
@@ -1892,11 +1893,7 @@ class ComfyUIListWorkflowsTool(FunctionTool[AstrAgentContext]):
                 short_desc = desc_data.get("short", "") or "(无说明)"
             else:
                 short_desc = str(desc_data)[:50] if desc_data else "(无说明)"
-            slots = text_slots.get(filename, [])
-            slot_info = ""
-            if slots:
-                slot_info = f" | Text slots: {', '.join(slots)}"
-            lines.append(f"- {name}: {short_desc} | {_format_workflow_required_params(w)}{slot_info}")
+            lines.append(f"- {name}: {short_desc}")
         
         return "\n".join(lines)
 
@@ -1904,7 +1901,7 @@ class ComfyUIListWorkflowsTool(FunctionTool[AstrAgentContext]):
 class ComfyUIGetWorkflowDetailTool(FunctionTool[AstrAgentContext]):
     """
     获取指定工作流的详细说明。
-    当需要了解某个工作流的详细用途、参数说明时使用。
+    当需要了解某个工作流的详细用途和参数说明时使用。
     """
 
     name: str = "comfyui_get_workflow_detail"
@@ -1934,7 +1931,6 @@ class ComfyUIGetWorkflowDetailTool(FunctionTool[AstrAgentContext]):
         
         active_port = _get_active_comfyui_port(config)
         descriptions = await _load_workflow_descriptions(config)
-        text_slots = _load_workflow_text_slots()
         wf_dir = _get_workflow_dir()
         workflows = _filter_workflows_for_port(_list_workflows_in_configured_dir(wf_dir), active_port)
         
@@ -1958,15 +1954,10 @@ class ComfyUIGetWorkflowDetailTool(FunctionTool[AstrAgentContext]):
             short_desc = str(desc_data) if desc_data else ""
             detailed_desc = short_desc
         
-        slots = text_slots.get(filename, [])
-        
         result = f"Workflow: {workflow_name}\n"
         result += f"Filename: {filename}\n"
-        result += f"Params: {_format_workflow_required_params(target_wf)}\n"
         result += f"Short description: {short_desc or '(无)'}\n"
-        result += f"Detailed description: {detailed_desc or '(无)'}\n"
-        if slots:
-            result += f"Text slots: {', '.join(slots)}"
+        result += f"Detailed description: {detailed_desc or '(无)'}"
         
         return result
 
@@ -2580,7 +2571,7 @@ class ComfyUIExecuteTool(FunctionTool[AstrAgentContext]):
                 "texts": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Required when workflow needs text. Content must match workflow description and text_slots (see comfyui_list_workflows)—e.g. modification instruction like '根据图2的XX修改图1', not just image content description. Generate according to workflow requirement and user intent.",
+                    "description": "Text inputs for the workflow. Content must follow the workflow description from comfyui_list_workflows.",
                 },
                 "videos": {
                     "type": "array",
@@ -2675,13 +2666,13 @@ class ComfyUIExecuteTool(FunctionTool[AstrAgentContext]):
                 # 同名工作流存在，检查参数需求
                 required = []
                 for w in matching_names:
-                    required.append(f"'{w['filename']}' ({_format_workflow_required_params(w)})")
+                    required.append(f"'{w['filename']}'")
                 
                 if required:
                     return (
                         f"工作流 '{workflow_name}' 存在，但参数不匹配。你传了 texts={len(texts)}, images={len(images_b64)}, videos={len(videos)}。\n"
-                        f"该工作流有以下版本可用：\n" + "\n".join(f"- {r}" for r in required) + "\n"
-                        f"请选择正确的版本（参数数量匹配的工作流），或提供正确数量的参数。"
+                        f"同名工作流文件：\n" + "\n".join(f"- {r}" for r in required) + "\n"
+                        f"请检查工作流说明，或在管理页调整参数配置。"
                     )
             
             hint = ""
@@ -2693,8 +2684,8 @@ class ComfyUIExecuteTool(FunctionTool[AstrAgentContext]):
                 )
             return (
                 f"没有找到匹配的工作流「{workflow_name}」（当前提供：文本{len(texts)}，图片{len(images_b64)}，视频{len(videos)}）。"
-                "请使用 comfyui_list_workflows 查看可用工作流和所需参数。"
-                "Possible reasons: (1) workflow name typo—use exact name from list; (2) too few texts/images/videos—check required counts; (3) image_urls rejected (URL failed or path outside allowed dir)."
+                "请使用 comfyui_list_workflows 查看可用工作流说明。"
+                "可能原因：工作流名称不准确、输入数量不符合管理页配置，或 image_urls 无法读取。"
                 + hint
             )
         info = _get_configured_workflow_info(wf_dir, Path(workflow_file).name)
