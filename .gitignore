@@ -16,9 +16,6 @@ docs_*.txt
 # Local-only script (do not push to GitHub)
 publish_to_github.ps1
 
-# Config schema (AstrBot 会从 metadata 读取，可不发布；若需发布请移除此行)
-_conf_schema.json
-
 # Logs
 *.log
 

@@ -77,9 +77,9 @@ except ImportError:
 def _resolve_plugin_data_dir() -> Path:
     try:
         from astrbot.api.star import StarTools
-        return Path(StarTools.get_data_dir("astrbot_plugin_comfyui"))
+        return Path(StarTools.get_data_dir("astrbot_plugin_comfyui_pro"))
     except Exception:
-        return Path("data/plugin_data/astrbot_plugin_comfyui").resolve()
+        return Path("data/plugin_data/astrbot_plugin_comfyui_pro").resolve()
 
 
 PLUGIN_DATA_DIR = _resolve_plugin_data_dir()
@@ -425,7 +425,7 @@ def _filter_workflows_for_port(workflows: List[Dict[str, Any]], port: Dict[str, 
 def _get_server_config(config: Any) -> tuple:
     port = _get_active_comfyui_port(config)
     server_ip = port["http"]
-    client_id = str(_config_get(config, "client_id", "astrbot-comfyui-1") or "astrbot-comfyui-1").strip()
+    client_id = str(_config_get(config, "client_id", "astrbot-comfyui-pro-1") or "astrbot-comfyui-pro-1").strip()
     return server_ip, client_id
 
 
@@ -813,7 +813,7 @@ async def _get_first_task_from_queue(server_ip: str) -> Optional[tuple]:
             for item in running + pending:
                 if isinstance(item, (list, tuple)) and len(item) >= 2:
                     prompt_id = item[1]
-                    client_id = item[0] if item[0] else "astrbot-comfyui-1"
+                    client_id = item[0] if item[0] else "astrbot-comfyui-pro-1"
                     if prompt_id:
                         return (str(prompt_id), str(client_id))
     except Exception as e:
@@ -2786,10 +2786,10 @@ class ComfyUIExecuteTool(FunctionTool[AstrAgentContext]):
 
 
 @register(
-    "comfyui",
-    "ComfyUI",
-    "ComfyUI 工作流 LLM 工具：执行/查询工作流/等待查询/状态；支持配置上传与工作流说明",
-    "1.0.1",
+    "comfyui_pro",
+    "ComfyUI Pro",
+    "ComfyUI Pro：执行/查询工作流、WebSocket 等待、手动命令、多来源切换与工作流 WebUI 管理",
+    "1.0.2",
     "",
 )
 class ComfyUIPlugin(Star):

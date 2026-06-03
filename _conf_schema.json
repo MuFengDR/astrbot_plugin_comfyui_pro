@@ -1,0 +1,100 @@
+{
+  "client_id": {
+    "description": "ComfyUI client ID",
+    "type": "string",
+    "hint": "Used to identify this client in the ComfyUI queue and WebSocket events.",
+    "default": "astrbot-comfyui-pro-1"
+  },
+  "_ports_section": {
+    "description": "=== ComfyUI sources ===",
+    "type": "text",
+    "invisible": true
+  },
+  "comfyui_port_1_name": {
+    "description": "ComfyUI source 1 name",
+    "type": "string",
+    "hint": "This is the default source when /comfyuiport has not selected a source yet.",
+    "default": ""
+  },
+  "comfyui_port_1_http": {
+    "description": "ComfyUI source 1 HTTP address",
+    "type": "string",
+    "hint": "Example: http://127.0.0.1:8188 or 127.0.0.1:8188",
+    "default": "127.0.0.1:8188"
+  },
+  "comfyui_port_2_name": {
+    "description": "ComfyUI source 2 name",
+    "type": "string",
+    "default": ""
+  },
+  "comfyui_port_2_http": {
+    "description": "ComfyUI source 2 HTTP address",
+    "type": "string",
+    "default": ""
+  },
+  "comfyui_port_3_name": {
+    "description": "ComfyUI source 3 name",
+    "type": "string",
+    "default": ""
+  },
+  "comfyui_port_3_http": {
+    "description": "ComfyUI source 3 HTTP address",
+    "type": "string",
+    "default": ""
+  },
+  "comfyui_port_4_name": {
+    "description": "ComfyUI source 4 name",
+    "type": "string",
+    "default": ""
+  },
+  "comfyui_port_4_http": {
+    "description": "ComfyUI source 4 HTTP address",
+    "type": "string",
+    "default": ""
+  },
+  "debug_mode": {
+    "description": "Debug mode",
+    "type": "bool",
+    "default": false,
+    "hint": "Print the workflow JSON sent to ComfyUI for troubleshooting text/image injection."
+  },
+  "websocket_wait_timeout_seconds": {
+    "description": "ComfyUI WebSocket wait timeout (seconds)",
+    "type": "int",
+    "default": 900,
+    "hint": "Maximum time comfyui_query_wait waits for ComfyUI WebSocket completion events. Set 0 to only check completed history. Runtime clamps to 0-3600 seconds."
+  },
+  "_history_section": {
+    "description": "=== History cleanup ===",
+    "type": "text",
+    "invisible": true
+  },
+  "auto_cleanup_hours": {
+    "description": "Auto cleanup history (hours)",
+    "type": "int",
+    "default": 48,
+    "hint": "History older than this value will be cleaned automatically. Set 0 to disable."
+  },
+  "_webui_section": {
+    "description": "=== Workflow management page ===",
+    "type": "text",
+    "invisible": true
+  },
+  "webui_enabled": {
+    "description": "Enable workflow management page",
+    "type": "bool",
+    "default": true,
+    "hint": "Enable uploading, listing, annotating, renaming, and deleting workflow JSON files in a browser."
+  },
+  "webui_host": {
+    "description": "Management page listen host",
+    "type": "string",
+    "default": "127.0.0.1",
+    "hint": "Use 0.0.0.0 to allow LAN access; 127.0.0.1 is local only."
+  },
+  "webui_port": {
+    "description": "Management page listen port",
+    "type": "int",
+    "default": 6187
+  }
+}
