@@ -12,6 +12,7 @@ def register_audit_routes(app: web.Application, ctx: ManagementContext) -> None:
     audit_stats_func = ctx.audit_stats_func
     audit_get_settings_func = ctx.audit_get_settings_func
     audit_save_settings_func = ctx.audit_save_settings_func
+    audit_test_func = ctx.audit_test_func
     audit_manual_func = ctx.audit_manual_func
     audit_retry_func = ctx.audit_retry_func
 
@@ -50,6 +51,17 @@ def register_audit_routes(app: web.Application, ctx: ManagementContext) -> None:
         status = 200 if isinstance(result, dict) and result.get("ok", True) else 400
         return web.json_response(result if isinstance(result, dict) else {"ok": False, "error": "invalid audit result"}, status=status)
 
+    async def audit_test_handler(request: web.Request) -> web.Response:
+        if not audit_test_func:
+            return web.json_response({"ok": False, "error": "audit api unavailable"}, status=501)
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        result = await _maybe_await(audit_test_func(data if isinstance(data, dict) else {}))
+        status = 200 if isinstance(result, dict) and result.get("ok", True) else 400
+        return web.json_response(result if isinstance(result, dict) else {"ok": False, "error": "invalid audit result"}, status=status)
+
     async def audit_manual_handler(request: web.Request) -> web.Response:
         if not audit_manual_func:
             return web.json_response({"ok": False, "error": "audit api unavailable"}, status=501)
@@ -82,5 +94,6 @@ def register_audit_routes(app: web.Application, ctx: ManagementContext) -> None:
     app.router.add_get("/api/audit/stats", audit_stats_handler)
     app.router.add_get("/api/audit/settings", audit_settings_handler)
     app.router.add_post("/api/audit/settings", audit_settings_handler)
+    app.router.add_post("/api/audit/test", audit_test_handler)
     app.router.add_post("/api/audit/manual", audit_manual_handler)
     app.router.add_post("/api/audit/retry", audit_retry_handler)

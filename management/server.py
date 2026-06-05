@@ -36,6 +36,7 @@ class ManagementServer:
         audit_stats_func: Callable[[], object] | None = None,
         audit_get_settings_func: Callable[[], object] | None = None,
         audit_save_settings_func: Callable[[dict[str, object]], object] | None = None,
+        audit_test_func: Callable[[dict[str, object]], object] | None = None,
         audit_manual_func: Callable[[str, str, str], object] | None = None,
         audit_retry_func: Callable[[str], object] | None = None,
     ):
@@ -63,6 +64,7 @@ class ManagementServer:
             audit_stats_func=audit_stats_func,
             audit_get_settings_func=audit_get_settings_func,
             audit_save_settings_func=audit_save_settings_func,
+            audit_test_func=audit_test_func,
             audit_manual_func=audit_manual_func,
             audit_retry_func=audit_retry_func,
         )

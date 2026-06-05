@@ -1169,16 +1169,18 @@ async def _append_completed_task_result(
         videos = [str(u) for u in (url.get("videos") or []) if u]
         audios = [str(u) for u in (url.get("audio") or []) if u]
         original_images = list(images)
+        delivery_images = list(original_images)
         audit_result = {"allowed_images": images, "blocked": [], "records": []}
         if _task_service and images:
             try:
                 task_images = []
                 if completed_task and isinstance(completed_task.get("result"), dict):
                     task_images = [str(u) for u in (completed_task["result"].get("images") or []) if u]
+                delivery_images = task_images or delivery_images
                 audit_result = await _task_service.audit_task_images(completed_task, task_images or images)
             except Exception as e:
                 logger.warning("ComfyUI content audit failed: %s", e)
-        image_delivery_items = _delivery_items_for_urls("image", original_images, audit_result.get("records") or [])
+        image_delivery_items = _delivery_items_for_urls("image", delivery_images, audit_result.get("records") or [])
         sendable_image_count = sum(1 for item in image_delivery_items if item.get("send_method") != "none")
         if image_delivery_items:
             _session_image_url_queue.setdefault(task_session_key, []).extend(image_delivery_items)
@@ -1221,15 +1223,17 @@ async def _append_completed_task_result(
     extra = "\n\n".join(texts).strip()
     if ftype == "image":
         audit_result = {"allowed_images": [url] if url else [], "blocked": [], "records": []}
+        delivery_images = [str(url)] if url else []
         if _task_service and url:
             try:
                 task_images = []
                 if completed_task and isinstance(completed_task.get("result"), dict):
                     task_images = [str(u) for u in (completed_task["result"].get("images") or []) if u]
+                delivery_images = task_images or delivery_images
                 audit_result = await _task_service.audit_task_images(completed_task, task_images or [url])
             except Exception as e:
                 logger.warning("ComfyUI content audit failed: %s", e)
-        image_delivery_items = _delivery_items_for_urls("image", [str(url)], audit_result.get("records") or [])
+        image_delivery_items = _delivery_items_for_urls("image", delivery_images, audit_result.get("records") or [])
         sendable_image_count = sum(1 for item in image_delivery_items if item.get("send_method") != "none")
         if image_delivery_items:
             _session_image_url_queue.setdefault(task_session_key, []).extend(image_delivery_items)
@@ -2142,10 +2146,13 @@ class ComfyUIPlugin(Star):
         return self._content_audit.stats()
 
     def get_audit_settings(self) -> Dict[str, Any]:
-        return {"ok": True, "settings": self._content_audit.load_settings()}
+        return {"ok": True, "settings": self._content_audit.public_settings()}
 
     def save_audit_settings(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": True, "settings": self._content_audit.save_settings(payload)}
+
+    async def test_audit_settings(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return await self._content_audit.test_image_provider(payload)
 
     def manual_audit_review(self, record_id: str, decision: str, reason: str = "") -> Dict[str, Any]:
         return self._content_audit.manual_review(record_id, decision, reason)
@@ -2819,6 +2826,7 @@ class ComfyUIPlugin(Star):
                 audit_stats_func=self.get_audit_stats,
                 audit_get_settings_func=self.get_audit_settings,
                 audit_save_settings_func=self.save_audit_settings,
+                audit_test_func=self.test_audit_settings,
                 audit_manual_func=self.manual_audit_review,
                 audit_retry_func=self.retry_audit_record,
             )

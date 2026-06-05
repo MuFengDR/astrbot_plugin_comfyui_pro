@@ -29,6 +29,7 @@ class ManagementContext:
     audit_stats_func: Callable[[], object] | None = None
     audit_get_settings_func: Callable[[], object] | None = None
     audit_save_settings_func: Callable[[dict[str, object]], object] | None = None
+    audit_test_func: Callable[[dict[str, object]], object] | None = None
     audit_manual_func: Callable[[str, str, str], object] | None = None
     audit_retry_func: Callable[[str], object] | None = None
     output_media_dir: Path | None = None
