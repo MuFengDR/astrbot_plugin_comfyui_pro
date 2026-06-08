@@ -57,20 +57,42 @@ class ComfyUIGetWorkflowDetailTool(FunctionTool[AstrAgentContext]):
         if not target_wf:
             return f"未找到工作流「{workflow_name}」。"
         
+        unavailable = runtime._workflow_availability_error(target_wf, workflows)
+        if unavailable:
+            return f"Workflow '{workflow_name}' is currently unavailable: {unavailable}"
+
         filename = target_wf.get("filename", "")
         desc_data = descriptions.get(filename, {})
         
         if isinstance(desc_data, dict):
-            short_desc = desc_data.get("short", "")
             detailed_desc = desc_data.get("detailed", "")
         else:
-            short_desc = str(desc_data) if desc_data else ""
-            detailed_desc = short_desc
+            detailed_desc = str(desc_data) if desc_data else ""
         
         result = f"Workflow: {workflow_name}\n"
         result += f"Filename: {filename}\n"
-        result += f"Short description: {short_desc or '(无)'}\n"
-        result += f"Detailed description: {detailed_desc or '(无)'}"
+        params = target_wf.get("params") if isinstance(target_wf.get("params"), dict) else {}
+        slots = params.get("slots") if isinstance(params.get("slots"), list) else []
+        if slots:
+            kind_names = {"text": "文本", "image": "图片", "video": "视频"}
+            direction_names = {"input": "输入", "output": "输出"}
+            slot_lines = []
+            for slot in slots:
+                if not isinstance(slot, dict):
+                    continue
+                if slot.get("hidden"):
+                    continue
+                direction = direction_names.get(slot.get("direction"), str(slot.get("direction") or ""))
+                kind = kind_names.get(slot.get("kind"), str(slot.get("kind") or ""))
+                explain = str(slot.get("explain") or "").strip()
+                title = str(slot.get("title") or "").strip()
+                title_text = f" {title}" if title else ""
+                suffix = f": {explain}" if explain else ""
+                optional = "可缺省" if slot.get("optional") else "必填"
+                slot_lines.append(f"- {direction}{kind}{slot.get('index')}{title_text}（{optional}）{suffix}")
+            if slot_lines:
+                result += "\nDetected slots:\n" + "\n".join(slot_lines)
+        result += f"\nDetailed description: {detailed_desc or '(无)'}"
         
         return result
 

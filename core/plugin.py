@@ -139,7 +139,9 @@ from .workflow_meta import (
     _load_workflow_params,
     _load_workflow_text_slots,
     _save_workflow_meta,
+    _workflow_availability_error,
     _workflow_input_mismatch_message,
+    _workflow_is_available,
 )
 
 from .config import (
@@ -449,7 +451,7 @@ def _load_send_policy() -> Dict[str, Dict[str, str]]:
     default_policy = {
         "audit_disabled": dict(default_row),
         "audit_error": dict(default_row),
-        "audit_hit": {"text": "direct", "image": "none", "video": "none"},
+        "audit_hit": {"text": "direct", "image": "obfuscated", "video": "none"},
         "audit_pass": dict(default_row),
     }
     try:
@@ -516,8 +518,12 @@ def _delivery_items_for_urls(media_type: str, urls: List[str], audit_records: Op
     items: List[Dict[str, Any]] = []
     for url in [str(u) for u in urls if u]:
         record = records_by_url.get(url)
-        audit_state = _audit_state_from_record(record)
-        method = _resolve_send_method(media_type, audit_state)
+        audit_state = str((record or {}).get("audit_state") or _audit_state_from_record(record))
+        method = str((record or {}).get("send_method") or _resolve_send_method(media_type, audit_state)).strip().lower()
+        if method == "obfuscated" and media_type != "image":
+            method = "direct"
+        if method not in {"direct", "none", "obfuscated"}:
+            method = "direct"
         notice = ""
         if method == "none":
             notice = "内容已生成，但按发送策略未发送。"
@@ -849,12 +855,50 @@ async def _estimate_remaining_seconds(server_ip: str, prompt_id: str) -> int:
     return 0
 
 
-def _normalize_output_rules_arg(output_rules: Any) -> Dict[str, Dict[str, Any]]:
+def _build_output_rules(info: Dict[str, Any]) -> Dict[str, Any]:
+    params = (info or {}).get("params") if isinstance(info, dict) else {}
+    if not isinstance(params, dict):
+        params = {}
+    slots = [
+        slot
+        for slot in (params.get("slots") or [])
+        if isinstance(slot, dict) and slot.get("direction") == "output"
+        and not slot.get("hidden")
+    ]
+    return {
+        "text": params.get("outputs", {}).get("text", {}) if isinstance(params.get("outputs"), dict) else {},
+        "image": params.get("outputs", {}).get("image", {}) if isinstance(params.get("outputs"), dict) else {},
+        "video": params.get("outputs", {}).get("video", {}) if isinstance(params.get("outputs"), dict) else {},
+        "slots": slots,
+        "allow_other_outputs": bool(params.get("allow_other_outputs", False)),
+    }
+
+
+def _provided_input_count(values: List[Any]) -> int:
+    return sum(1 for item in (values or []) if str(item or "").strip())
+
+
+def _available_workflow_file_by_name(workflows: List[Dict[str, Any]], workflow_name: str, wf_dir: Path) -> Optional[str]:
+    workflow = next(
+        (
+            w
+            for w in workflows
+            if w.get("name") == workflow_name and _workflow_is_available(w, workflows)
+        ),
+        None,
+    )
+    filename = str((workflow or {}).get("filename") or "").strip()
+    return str(wf_dir / filename) if filename else None
+
+
+def _normalize_output_rules_arg(output_rules: Any) -> Dict[str, Any]:
     if isinstance(output_rules, int):
         return {
             "text": {"limit": output_rules, "mode": "loose"},
             "image": {"limit": None, "mode": "loose"},
             "video": {"limit": None, "mode": "loose"},
+            "slots": [],
+            "allow_other_outputs": False,
         }
     if not isinstance(output_rules, dict):
         output_rules = {}
@@ -862,6 +906,8 @@ def _normalize_output_rules_arg(output_rules: Any) -> Dict[str, Dict[str, Any]]:
         "text": output_rules.get("text", {}) if isinstance(output_rules.get("text"), dict) else {},
         "image": output_rules.get("image", {}) if isinstance(output_rules.get("image"), dict) else {},
         "video": output_rules.get("video", {}) if isinstance(output_rules.get("video"), dict) else {},
+        "slots": output_rules.get("slots", []) if isinstance(output_rules.get("slots"), list) else [],
+        "allow_other_outputs": bool(output_rules.get("allow_other_outputs", False)),
     }
 
 
@@ -877,6 +923,111 @@ def _apply_output_rule(values: List[Any], rule: Dict[str, Any], label: str) -> t
     return True, values[:limit], ""
 
 
+def _output_slot_label(slot: Dict[str, Any]) -> str:
+    kind_label = {"text": "文本", "image": "图片", "video": "视频"}.get(str(slot.get("kind") or ""), "输出")
+    index = int(slot.get("index") or 0)
+    title = str(slot.get("title") or "").strip()
+    explain = str(slot.get("explain") or "").strip()
+    parts = [f"[{kind_label}{index}]"]
+    if title:
+        parts.append(title)
+    if explain:
+        parts.append(explain)
+    return " ".join(parts).strip()
+
+
+def _extract_node_text_outputs(out: Any, max_texts: Optional[int] = None) -> List[str]:
+    texts: List[str] = []
+    if not isinstance(out, dict) or "text" not in out:
+        return texts
+    text_value = out.get("text")
+    if isinstance(text_value, str):
+        candidates = [text_value]
+    elif isinstance(text_value, list):
+        candidates = text_value
+    else:
+        return texts
+    for item in candidates:
+        text = str(item or "").strip()
+        if text:
+            texts.append(text)
+            if max_texts is not None and len(texts) >= max_texts:
+                return texts
+    return texts
+
+
+def _extract_node_media_outputs(base: str, out: Any, key: str) -> List[str]:
+    values: List[str] = []
+    if not isinstance(out, dict) or key not in out:
+        return values
+    for item in out.get(key) or []:
+        if not isinstance(item, dict) or item.get("type") != "output":
+            continue
+        fn, sub = item.get("filename"), item.get("subfolder", "")
+        if not fn:
+            continue
+        url = f"{base}/view?filename={fn}&subfolder={sub}&type=output" if sub else f"{base}/view?filename={fn}&type=output"
+        values.append(url)
+    return values
+
+
+def _append_unique(target: List[str], values: List[str]) -> None:
+    seen = set(target)
+    for value in values:
+        if value and value not in seen:
+            target.append(value)
+            seen.add(value)
+
+
+def _extract_other_history_outputs(base: str, outputs: Any, excluded_node_ids: set[str]) -> tuple[List[str], List[str], List[str], List[str]]:
+    texts: List[str] = []
+    images: List[str] = []
+    videos: List[str] = []
+    audios: List[str] = []
+    if not isinstance(outputs, dict):
+        return texts, images, videos, audios
+    for node_id, out in outputs.items():
+        if str(node_id) in excluded_node_ids:
+            continue
+        _append_unique(texts, _extract_node_text_outputs(out))
+        _append_unique(images, _extract_node_media_outputs(base, out, "images"))
+        _append_unique(videos, _extract_node_media_outputs(base, out, "gifs"))
+        _append_unique(audios, _extract_node_media_outputs(base, out, "audio"))
+    return texts, images, videos, audios
+
+
+def _extract_slot_outputs(base: str, outputs: Any, slots: List[Dict[str, Any]]) -> tuple[bool, List[str], List[str], List[str], List[str]]:
+    texts: List[str] = []
+    images: List[str] = []
+    videos: List[str] = []
+    messages: List[str] = []
+    if not isinstance(outputs, dict):
+        return False, texts, images, videos, ["ComfyUI history 中没有可读取的输出。"]
+    ordered_slots = sorted(
+        [slot for slot in slots if isinstance(slot, dict) and slot.get("direction") == "output"],
+        key=lambda slot: ({"text": 0, "image": 1, "video": 2}.get(str(slot.get("kind") or ""), 9), int(slot.get("index") or 0)),
+    )
+    for slot in ordered_slots:
+        if slot.get("enabled", True) is False:
+            continue
+        out = outputs.get(str(slot.get("node_id") or ""))
+        kind = str(slot.get("kind") or "")
+        if kind == "text":
+            values = _extract_node_text_outputs(out)
+            texts.extend(values)
+        elif kind == "image":
+            values = _extract_node_media_outputs(base, out, "images")
+            images.extend(values)
+        elif kind == "video":
+            values = _extract_node_media_outputs(base, out, "gifs")
+            videos.extend(values)
+        else:
+            values = []
+        if not values and not bool(slot.get("optional", False)):
+            messages.append(f"缺少必填输出：{_output_slot_label(slot)}")
+    return not messages, texts, images, videos, messages
+
+
 async def _get_result_for_prompt(server_ip: str, prompt_id: str, output_rules: Any = None) -> tuple:
     """任务已完成时，从 history 拉取结果。返回 (media_outputs, file_type, text_outputs)。"""
     base = _get_comfyui_http_base(server_ip)
@@ -890,6 +1041,37 @@ async def _get_result_for_prompt(server_ip: str, prompt_id: str, output_rules: A
         return None, "unknown", []
     outputs = info[prompt_id]["outputs"]
     rules = _normalize_output_rules_arg(output_rules)
+    slot_rules = [
+        slot
+        for slot in (rules.get("slots") or [])
+        if isinstance(slot, dict) and slot.get("direction") == "output"
+    ]
+    if slot_rules:
+        ok_slots, texts, images, videos, messages = _extract_slot_outputs(base, outputs, slot_rules)
+        audios: List[str] = []
+        if rules.get("allow_other_outputs", False):
+            excluded_node_ids = {str(slot.get("node_id") or "") for slot in slot_rules if isinstance(slot, dict)}
+            other_texts, other_images, other_videos, other_audios = _extract_other_history_outputs(
+                base, outputs, excluded_node_ids
+            )
+            _append_unique(texts, other_texts)
+            _append_unique(images, other_images)
+            _append_unique(videos, other_videos)
+            _append_unique(audios, other_audios)
+        if not ok_slots:
+            return None, "error", messages
+        media = {"images": images, "videos": videos, "audio": audios}
+        media_count = len(images) + len(videos) + len(audios)
+        if media_count == 0:
+            return None, "text" if texts else "unknown", texts
+        if len(images) and not videos and not audios:
+            return media, "image", texts
+        if len(videos) and not images and not audios:
+            return media, "video", texts
+        if len(audios) and not images and not videos:
+            return media, "audio", texts
+        return media, "mixed", texts
+
     texts = _extract_history_text_outputs(outputs, None)
     images: List[str] = []
     videos: List[str] = []
@@ -1297,9 +1479,10 @@ async def _submit_comfyui_workflow(
     origin: str = "command",
 ) -> Dict[str, Any]:
     workflow_name = (workflow_name or "").strip()
-    texts = [str(t) for t in (texts or []) if str(t).strip()]
-    videos = [str(v).strip() for v in (videos or []) if str(v).strip()]
-    image_urls_arg = [str(u).strip() for u in (image_urls_arg or []) if str(u).strip()]
+    texts = [str(t) for t in (texts or [])]
+    videos = [str(v).strip() for v in (videos or [])]
+    image_urls_arg = [str(u).strip() for u in (image_urls_arg or [])]
+    explicit_image_urls = bool(image_urls_arg)
     session_tag = (session_tag or "").strip()
     if not workflow_name:
         return {"ok": False, "message": "缺少工作流名称。"}
@@ -1315,6 +1498,12 @@ async def _submit_comfyui_workflow(
     workflow_params = _load_workflow_params()
     all_workflows = list_workflows_in_dir(wf_dir, workflow_params)
     workflows = _filter_workflows_for_port(all_workflows, active_port)
+    unavailable_matches = [w for w in workflows if w.get("name") == workflow_name and not _workflow_is_available(w, workflows)]
+    if unavailable_matches:
+        return {
+            "ok": False,
+            "message": f"工作流「{workflow_name}」当前不可用：{_workflow_availability_error(unavailable_matches[0], workflows)} 请在管理页修复后保存。",
+        }
     if any(w["name"] == workflow_name for w in all_workflows) and not any(w["name"] == workflow_name for w in workflows):
         available = sorted({w["name"] for w in workflows})
         available_text = "、".join(available) if available else "无"
@@ -1326,8 +1515,8 @@ async def _submit_comfyui_workflow(
                 "可以使用 /comfyui_port <接口名称> 切换到其他接口，或在 Management page 中调整该接口的可用工作流。"
             ),
         }
-    images_b64 = await _extract_images_from_event_async(event) if event else []
-    if image_urls_arg:
+    images_b64 = [] if explicit_image_urls else (await _extract_images_from_event_async(event) if event else [])
+    if explicit_image_urls:
         from_sources = await _image_sources_to_base64(image_urls_arg)
         images_b64.extend(from_sources)
         if from_sources:
@@ -1337,16 +1526,18 @@ async def _submit_comfyui_workflow(
         workflow_name, len(texts), len(images_b64), len(videos), wf_dir, workflow_params
     )
     if not workflow_file:
-        matching_names = [w for w in workflows if w["name"] == workflow_name]
-        if matching_names:
+        workflow_file = _available_workflow_file_by_name(workflows, workflow_name, wf_dir)
+    if not workflow_file:
+        matching_workflow = next((w for w in workflows if w["name"] == workflow_name), None)
+        if matching_workflow:
             return {
                 "ok": False,
                 "message": _workflow_input_mismatch_message(
                     workflow_name,
-                    matching_names,
-                    len(texts),
-                    len(images_b64),
-                    len(videos),
+                    [matching_workflow],
+                    texts,
+                    images_b64,
+                    videos,
                 ),
             }
         hint = ""
@@ -1358,7 +1549,7 @@ async def _submit_comfyui_workflow(
         return {
             "ok": False,
             "message": (
-                f"没有找到匹配的工作流「{workflow_name}」（当前提供：文本{len(texts)}，图片{len(images_b64)}，视频{len(videos)}）。"
+                f"没有找到匹配的工作流「{workflow_name}」（当前提供：文本{_provided_input_count(texts)}，图片{_provided_input_count(images_b64)}，视频{_provided_input_count(videos)}）。"
                 "请使用 /comfyui list 或 comfyui_list_workflows 查看可用工作流说明。"
                 + hint
             ),
@@ -1387,7 +1578,7 @@ async def _submit_comfyui_workflow(
             "ok": False,
             "message": (
                 f"工作流「{workflow_name}」参数数量不匹配。"
-                f"当前提供：文本{len(texts)}，图片{len(images_b64)}，视频{len(videos)}。"
+                f"当前提供：文本{_provided_input_count(texts)}，图片{_provided_input_count(images_b64)}，视频{_provided_input_count(videos)}。"
                 + (" " + input_error if input_error else "")
                 + desc_reminder
             ),
@@ -1399,7 +1590,7 @@ async def _submit_comfyui_workflow(
         workflow.load_workflow_api(workflow_file)
         prompt_id = await workflow.submit_only(images_b64, texts, videos, debug=debug)
         session_key = _get_session_key(context)
-        output_rules = (info.get("params") or {}).get("outputs") or {}
+        output_rules = _build_output_rules(info)
         pending_data = {
             "prompt_id": prompt_id,
             "server_ip": server_ip,
@@ -1486,9 +1677,9 @@ async def _submit_comfyui_workflow_to_port(
     videos: List[str],
 ) -> Dict[str, Any]:
     workflow_name = (workflow_name or "").strip()
-    texts = [str(t) for t in (texts or []) if str(t).strip()]
-    images_b64 = [str(img) for img in (images_b64 or []) if str(img).strip()]
-    videos = [str(v).strip() for v in (videos or []) if str(v).strip()]
+    texts = [str(t) for t in (texts or [])]
+    images_b64 = [str(img) for img in (images_b64 or [])]
+    videos = [str(v).strip() for v in (videos or [])]
     if not workflow_name:
         return {"ok": False, "message": "缺少工作流名称。"}
     if not isinstance(port, dict) or not port.get("name") or not port.get("http"):
@@ -1501,6 +1692,12 @@ async def _submit_comfyui_workflow_to_port(
     workflow_params = _load_workflow_params()
     all_workflows = list_workflows_in_dir(wf_dir, workflow_params)
     workflows = _filter_workflows_for_port(all_workflows, port)
+    unavailable_matches = [w for w in workflows if w.get("name") == workflow_name and not _workflow_is_available(w, workflows)]
+    if unavailable_matches:
+        return {
+            "ok": False,
+            "message": f"工作流「{workflow_name}」当前不可用：{_workflow_availability_error(unavailable_matches[0], workflows)} 请在管理页修复后保存。",
+        }
     if any(w["name"] == workflow_name for w in all_workflows) and not any(w["name"] == workflow_name for w in workflows):
         return {
             "ok": False,
@@ -1511,23 +1708,25 @@ async def _submit_comfyui_workflow_to_port(
         workflow_name, len(texts), len(images_b64), len(videos), wf_dir, workflow_params
     )
     if not workflow_file:
-        matching_names = [w for w in workflows if w["name"] == workflow_name]
-        if matching_names:
+        workflow_file = _available_workflow_file_by_name(workflows, workflow_name, wf_dir)
+    if not workflow_file:
+        matching_workflow = next((w for w in workflows if w["name"] == workflow_name), None)
+        if matching_workflow:
             return {
                 "ok": False,
                 "message": _workflow_input_mismatch_message(
                     workflow_name,
-                    matching_names,
-                    len(texts),
-                    len(images_b64),
-                    len(videos),
+                    [matching_workflow],
+                    texts,
+                    images_b64,
+                    videos,
                 ),
             }
         return {
             "ok": False,
             "message": (
                 f"没有找到匹配的工作流「{workflow_name}」"
-                f"（当前提供：文本{len(texts)}，图片{len(images_b64)}，视频{len(videos)}）。"
+                f"（当前提供：文本{_provided_input_count(texts)}，图片{_provided_input_count(images_b64)}，视频{_provided_input_count(videos)}）。"
             ),
         }
 
@@ -1542,7 +1741,7 @@ async def _submit_comfyui_workflow_to_port(
             "ok": False,
             "message": (
                 f"工作流「{workflow_name}」参数数量不匹配。"
-                f"当前提供：文本{len(texts)}，图片{len(images_b64)}，视频{len(videos)}。"
+                f"当前提供：文本{_provided_input_count(texts)}，图片{_provided_input_count(images_b64)}，视频{_provided_input_count(videos)}。"
                 + (" " + input_error if input_error else "")
             ),
         }
@@ -1556,7 +1755,7 @@ async def _submit_comfyui_workflow_to_port(
         workflow = ComfyUIWorkflow(server_ip, client_id)
         workflow.load_workflow_api(workflow_file)
         prompt_id = await workflow.submit_only(images_b64, texts, videos, debug=debug)
-        output_rules = (info.get("params") or {}).get("outputs") or {}
+        output_rules = _build_output_rules(info)
         return {
             "ok": True,
             "prompt_id": prompt_id,
@@ -1592,6 +1791,7 @@ from ..commands.comfyui import (
     _extract_command_media_sources,
     _extract_command_media_sources_async,
     _format_command_result,
+    _format_workflow_input_requirements,
     _format_workflow_required_params,
     _normalize_comfyui_command_text,
     _normalize_prefixed_command_text,
@@ -1794,14 +1994,20 @@ async def _image_sources_to_base64(sources: List[str]) -> List[str]:
     result: List[str] = []
     for s in sources:
         if not s or not isinstance(s, str):
+            result.append("")
             continue
         s = s.strip()
+        if not s:
+            result.append("")
+            continue
         # 1) data:image/xxx;base64,<payload>
         if s.startswith("data:image") and "base64," in s:
             b64 = _extract_base64_from_data_uri(s)
             if b64:
                 result.append(b64)
                 logger.info("[ComfyUI Tool] Using image from data URI (base64) in image_urls.")
+            else:
+                result.append("")
             continue
         # 2) base64: 或 base64://<payload>（工具如 qts_get_message_detail 可能返回的「乱码」实为 base64）
         if s.startswith("base64://"):
@@ -1817,6 +2023,7 @@ async def _image_sources_to_base64(sources: List[str]) -> List[str]:
                 logger.info("[ComfyUI Tool] Using image from base64: prefix in image_urls.")
             except Exception as e:
                 logger.warning("ComfyUI invalid base64 in image_urls: %s", e)
+                result.append("")
             continue
         # 3) 无前缀的纯 base64（如 qts_get_message_detail 返回的「乱码」实为 base64）
         if len(s) >= 100 and all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r" for c in s):
@@ -1832,9 +2039,11 @@ async def _image_sources_to_base64(sources: List[str]) -> List[str]:
         if not s.startswith("http"):
             p = Path(s)
             if not p.exists() or not p.is_file():
+                result.append("")
                 continue
             if not _is_allowed_local_image_path(p):
                 logger.warning("ComfyUI rejected local image path (outside allowed dir): %s", s[:80])
+                result.append("")
                 continue
             try:
                 async with aiofiles.open(p, "rb") as f:
@@ -1842,6 +2051,7 @@ async def _image_sources_to_base64(sources: List[str]) -> List[str]:
                 result.append(base64.b64encode(data).decode("utf-8"))
             except Exception as e:
                 logger.warning("ComfyUI read local image failed: %s", e)
+                result.append("")
             continue
         # 4) 服务器 URL
         try:
@@ -1849,8 +2059,11 @@ async def _image_sources_to_base64(sources: List[str]) -> List[str]:
                 resp = await client.get(s.replace("\n", ""))
                 if resp.status_code == 200 and resp.content:
                     result.append(base64.b64encode(resp.content).decode("utf-8"))
+                else:
+                    result.append("")
         except Exception as e:
             logger.warning("ComfyUI fetch image_url failed: %s", e)
+            result.append("")
     return result
 
 
@@ -2153,12 +2366,6 @@ class ComfyUIPlugin(Star):
 
     async def test_audit_settings(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         return await self._content_audit.test_image_provider(payload)
-
-    def manual_audit_review(self, record_id: str, decision: str, reason: str = "") -> Dict[str, Any]:
-        return self._content_audit.manual_review(record_id, decision, reason)
-
-    async def retry_audit_record(self, record_id: str) -> Dict[str, Any]:
-        return await self._content_audit.retry(record_id)
 
     async def _save_webui_debug_thumbnail(self, task: Dict[str, Any]) -> None:
         result = task.get("result") if isinstance(task.get("result"), dict) else {}
@@ -2827,8 +3034,6 @@ class ComfyUIPlugin(Star):
                 audit_get_settings_func=self.get_audit_settings,
                 audit_save_settings_func=self.save_audit_settings,
                 audit_test_func=self.test_audit_settings,
-                audit_manual_func=self.manual_audit_review,
-                audit_retry_func=self.retry_audit_record,
             )
             await self._web_server.start(host, port)
             if host == "0.0.0.0":
@@ -3053,24 +3258,25 @@ class ComfyUIPlugin(Star):
             active_port = _get_active_comfyui_port(self.config or {})
             wf_dir = _get_workflow_dir()
             workflows = _filter_workflows_for_port(_list_workflows_in_configured_dir(wf_dir), active_port)
-            descriptions = await _load_workflow_descriptions(self.config)
             if not workflows:
                 yield event.plain_result(f"当前 ComfyUI 接口「{active_port['name']}」没有可用工作流。请使用 /comfyui_port 切换接口，或调整该接口的可用工作流配置。")
                 return
             lines = []
-            for idx, w in enumerate(workflows, start=1):
-                desc_data = descriptions.get(w["filename"])
-                if isinstance(desc_data, dict):
-                    desc = desc_data.get("short", "") or "（未填写说明）"
-                else:
-                    desc = str(desc_data) if desc_data else "（未填写说明）"
+            command_workflows = [
+                w
+                for w in workflows
+                if _workflow_is_available(w, workflows)
+                and (w.get("params") if isinstance(w.get("params"), dict) else {}).get("inspection", {}).get("command_compatible", True)
+            ]
+            if not command_workflows:
+                yield event.plain_result(f"当前 ComfyUI 接口「{active_port['name']}」没有可通过 /comfyui 命令调用的工作流。")
+                return
+            for idx, w in enumerate(command_workflows, start=1):
                 if idx > 1:
                     lines.append("")
-                lines.append(f"『{idx}』")
-                lines.append(f"> {w['name']} ")
-                lines.append("")
+                lines.append(f"『{idx}』 > {w['name']} ")
                 lines.append("```")
-                lines.extend(_escape_telegram_code_block_text(desc).splitlines())
+                lines.extend(_escape_telegram_code_block_text(_format_workflow_input_requirements(w)).splitlines())
                 lines.append("```")
             yield event.plain_result("\n".join(lines))
             return
@@ -3115,8 +3321,22 @@ class ComfyUIPlugin(Star):
         active_port = _get_active_comfyui_port(self.config or {})
         wf_dir = _get_workflow_dir()
         workflows = _filter_workflows_for_port(_list_workflows_in_configured_dir(wf_dir), active_port)
-        workflow_name = _resolve_workflow_selector(selector, workflows)
+        command_workflows = [
+            w
+            for w in workflows
+            if _workflow_is_available(w, workflows)
+            and (w.get("params") if isinstance(w.get("params"), dict) else {}).get("inspection", {}).get("command_compatible", True)
+        ]
+        workflow_name = _resolve_workflow_selector(selector, command_workflows)
         if not workflow_name:
+            hidden = next((w for w in workflows if str(w.get("name") or "") == selector), None)
+            if hidden:
+                unavailable = _workflow_availability_error(hidden, workflows)
+                if unavailable:
+                    yield event.plain_result(f"该工作流当前不可用：{unavailable} 请在管理页修复后保存。")
+                else:
+                    yield event.plain_result("该工作流存在媒体可缺省项位于必填项之前，/comfyui 命令无法可靠调用；请使用 LLM 工具调用，或在管理页调整输入编号。")
+                return
             yield event.plain_result("用法：/comfyui list | /comfyui upload | /comfyui <工作流名称或编号> <文本1>|<文本2>")
             return
         image_urls, videos = await _extract_command_media_sources_async(event)

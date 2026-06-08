@@ -6,6 +6,7 @@ from pathlib import Path
 
 from aiohttp import web
 
+from .auth import WebUIAuth, auth_middleware, register_auth_routes
 from .context import ManagementContext
 from .debug import register_debug_routes
 from .interfaces import register_interface_routes
@@ -38,12 +39,12 @@ def create_app(
     audit_get_settings_func: Callable[[], object] | None = None,
     audit_save_settings_func: Callable[[dict[str, object]], object] | None = None,
     audit_test_func: Callable[[dict[str, object]], object] | None = None,
-    audit_manual_func: Callable[[str, str, str], object] | None = None,
-    audit_retry_func: Callable[[str], object] | None = None,
 ) -> web.Application:
-    app = web.Application()
     if plugin_data_dir is None:
         plugin_data_dir = workflows_dir.parent
+    auth = WebUIAuth(plugin_data_dir / "webui_auth.json")
+    auth.load_settings()
+    app = web.Application(middlewares=[auth_middleware(auth)])
     ctx = ManagementContext(
         workflows_dir=workflows_dir,
         meta_path=meta_path,
@@ -67,14 +68,14 @@ def create_app(
         audit_get_settings_func=audit_get_settings_func,
         audit_save_settings_func=audit_save_settings_func,
         audit_test_func=audit_test_func,
-        audit_manual_func=audit_manual_func,
-        audit_retry_func=audit_retry_func,
+        auth_manager=auth,
         output_media_dir=plugin_data_dir.resolve().parent.parent / "agent" / "comfyui" / "input",
         tmp_dir=plugin_data_dir / "tmp",
         media_history_dir=plugin_data_dir / "media" / "history",
         logo_path=Path(__file__).resolve().parent.parent / "webui_logo.jpg",
         webui_output_dir=plugin_data_dir / "webui" / "output",
     )
+    register_auth_routes(app, auth)
     register_ui_routes(app, ctx)
     register_workflow_routes(app, ctx)
     register_maintenance_routes(app, ctx)

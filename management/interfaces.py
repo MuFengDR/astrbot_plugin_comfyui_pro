@@ -2,8 +2,9 @@
 """ComfyUI interface configuration routes."""
 
 import json
+import re
 
-from aiohttp import web
+from aiohttp import ClientSession, ClientTimeout, web
 
 from ..workflow_engine import parse_workflow_filename
 from .context import ManagementContext
@@ -188,6 +189,62 @@ def register_interface_routes(app: web.Application, ctx: ManagementContext) -> N
             active_port_changed_func()
         return web.json_response({"ok": True, "active": name})
 
+    async def embed_check_handler(request: web.Request) -> web.Response:
+        name = str(request.query.get("port_name") or "").strip()
+        ports = _load_ports()
+        port = next((p for p in ports if str(p.get("name") or "") == name), None)
+        if not port:
+            return web.json_response({"ok": False, "error": "接口不存在"}, status=404)
+        url = _normalize_http(str(port.get("http") or ""))
+        if not url:
+            return web.json_response({"ok": False, "error": "接口地址为空"}, status=400)
+        try:
+            async with ClientSession(timeout=ClientTimeout(total=8)) as session:
+                async with session.get(url) as resp:
+                    x_frame = resp.headers.get("x-frame-options", "")
+                    csp = resp.headers.get("content-security-policy", "")
+                    status = resp.status
+        except Exception as e:
+            return web.json_response(
+                {"ok": False, "embeddable": False, "url": url, "error": f"接口不可访问：{e}"},
+                status=400,
+            )
+
+        origin = f"{request.scheme}://{request.host}"
+        reasons: list[str] = []
+        x_frame_lower = x_frame.lower()
+        if x_frame_lower:
+            if "deny" in x_frame_lower or "sameorigin" in x_frame_lower:
+                reasons.append(f"X-Frame-Options: {x_frame}")
+            elif "allow-from" in x_frame_lower and origin.lower() not in x_frame_lower:
+                reasons.append(f"X-Frame-Options: {x_frame}")
+
+        frame_ancestors = ""
+        match = re.search(r"frame-ancestors\s+([^;]+)", csp, flags=re.IGNORECASE)
+        if match:
+            frame_ancestors = match.group(1).strip()
+            ancestors_lower = frame_ancestors.lower()
+            allowed = "*" in ancestors_lower or origin.lower() in ancestors_lower
+            blocked_self_only = ancestors_lower in {"'self'", "self"} or "'none'" in ancestors_lower
+            if blocked_self_only or not allowed:
+                reasons.append(f"Content-Security-Policy frame-ancestors: {frame_ancestors}")
+
+        embeddable = not reasons
+        message = "接口可访问，未检测到禁止内嵌响应头。" if embeddable else "接口可访问，但浏览器可能会阻止内嵌。"
+        return web.json_response(
+            {
+                "ok": True,
+                "embeddable": embeddable,
+                "url": url,
+                "status": status,
+                "x_frame_options": x_frame,
+                "frame_ancestors": frame_ancestors,
+                "message": message,
+                "reasons": reasons,
+            }
+        )
+
     app.router.add_get("/api/ports", ports_handler)
     app.router.add_post("/api/ports", save_ports_handler)
     app.router.add_post("/api/active_port", active_port_handler)
+    app.router.add_get("/api/comfyui/embed_check", embed_check_handler)

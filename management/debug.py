@@ -50,16 +50,13 @@ def register_debug_routes(app: web.Application, ctx: ManagementContext) -> None:
                     try:
                         parsed = json.loads(raw)
                         if isinstance(parsed, list):
-                            texts.extend(str(item) for item in parsed if str(item).strip())
-                        elif str(parsed).strip():
+                            texts.extend(str(item) for item in parsed)
+                        else:
                             texts.append(str(parsed))
                     except Exception:
-                        if raw.strip():
-                            texts.append(raw.strip())
+                        texts.append(raw)
                 elif part.name in ("text", "texts[]"):
-                    text = (await part.text()).strip()
-                    if text:
-                        texts.append(text)
+                    texts.append(await part.text())
                 elif part.name in ("image", "images", "images[]"):
                     data = bytearray()
                     while True:

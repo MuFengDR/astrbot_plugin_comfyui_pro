@@ -24,7 +24,7 @@ def default_send_policy() -> Dict[str, Dict[str, str]]:
     return {
         "audit_disabled": dict(direct),
         "audit_error": dict(direct),
-        "audit_hit": {"text": "direct", "image": "none", "video": "none"},
+        "audit_hit": {"text": "direct", "image": "obfuscated", "video": "none"},
         "audit_pass": dict(direct),
     }
 

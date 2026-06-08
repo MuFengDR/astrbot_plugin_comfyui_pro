@@ -16,7 +16,7 @@ def _split_comfyui_command_args(msg: str) -> tuple[str, List[str]]:
     selector = parts[0].strip()
     text_part = parts[1].strip() if len(parts) > 1 else ""
     text_part = text_part.replace("｜", "|")
-    texts = [part.strip() for part in text_part.split("|") if part.strip()]
+    texts = [part.strip() for part in text_part.split("|")] if text_part else []
     return selector, texts
 
 
@@ -77,6 +77,38 @@ def _format_workflow_required_params(workflow: Dict[str, Any]) -> str:
         ]
     )
     return f"{in_text}；{out_text}"
+
+
+def _workflow_input_slots(workflow: Dict[str, Any]) -> List[Dict[str, Any]]:
+    params = workflow.get("params") if isinstance(workflow.get("params"), dict) else {}
+    slots = params.get("slots") if isinstance(params.get("slots"), list) else []
+    return sorted(
+        [
+            slot
+            for slot in slots
+            if isinstance(slot, dict) and slot.get("direction") == "input"
+            and not slot.get("hidden")
+        ],
+        key=lambda slot: (str(slot.get("kind") or ""), int(slot.get("index") or 0)),
+    )
+
+
+def _format_workflow_input_requirements(workflow: Dict[str, Any], include_defaults: bool = False) -> str:
+    slots = _workflow_input_slots(workflow)
+    if not slots:
+        return "需要以下输入：无"
+    order = {"text": 0, "image": 1, "video": 2}
+    slots = sorted(slots, key=lambda slot: (order.get(str(slot.get("kind") or ""), 9), int(slot.get("index") or 0)))
+    lines = ["需要以下输入："]
+    for slot in slots:
+        kind = str(slot.get("kind") or "")
+        kind_text = {"text": "文本", "image": "图片", "video": "视频"}.get(kind, kind)
+        explain = str(slot.get("explain") or "").strip() or "未填写说明"
+        optional = "可缺省" if slot.get("optional") else "必填"
+        title = str(slot.get("title") or "").strip() or "未命名节点"
+        line = f"【{kind_text}{slot.get('index')} {optional}】「{title}」{explain}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def _escape_markdown_table_cell(value: Any) -> str:
@@ -226,4 +258,4 @@ def _format_command_result(wait_result: Dict[str, Any]) -> str:
     return f"\u5b8c\u6210{elapsed_text}\uff0c\u4f46\u6ca1\u6709\u8f93\u51fa\u6587\u4ef6\u3002"
 
 
-__all__ = ['_split_comfyui_command_args', '_normalize_comfyui_command_text', '_normalize_prefixed_command_text', '_resolve_workflow_selector', '_format_workflow_required_params', '_escape_markdown_table_cell', '_escape_telegram_code_block_text', '_extract_command_media_sources', '_extract_command_media_sources_async', '_wait_for_command_result', '_format_command_result']
+__all__ = ['_split_comfyui_command_args', '_normalize_comfyui_command_text', '_normalize_prefixed_command_text', '_resolve_workflow_selector', '_format_workflow_required_params', '_format_workflow_input_requirements', '_escape_markdown_table_cell', '_escape_telegram_code_block_text', '_extract_command_media_sources', '_extract_command_media_sources_async', '_wait_for_command_result', '_format_command_result']

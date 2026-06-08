@@ -1,17 +1,29 @@
 # -*- coding: utf-8 -*-
 """Workflow management routes."""
 
+import base64
 import json
+import re
+import uuid
+from pathlib import Path
 
 from aiohttp import web
 
-from ..workflow_engine import parse_workflow_filename
+from ..workflow_engine import (
+    apply_workflow_slot_edits_file,
+    inspect_workflow_file,
+    list_workflows_in_dir,
+    parse_workflow_filename,
+)
 from .context import ManagementContext
 from .utils import SAFE_FILENAME_RE, safe_basename as _safe_basename
+
+WORKFLOW_NAME_RE = re.compile(r"^[\u4e00-\u9fff\u3040-\u30ffA-Za-z0-9_.:-]+$")
 
 
 def register_workflow_routes(app: web.Application, ctx: ManagementContext) -> None:
     workflows_dir = ctx.workflows_dir
+    output_media_dir = ctx.output_media_dir
     meta_path = ctx.meta_path
     load_meta = ctx.load_meta
     save_meta = ctx.save_meta
@@ -39,6 +51,16 @@ def register_workflow_routes(app: web.Application, ctx: ManagementContext) -> No
             json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
+    def _save_single_workflow_params(filename: str, params: dict[str, object]) -> None:
+        all_params = _load_workflow_params()
+        current = all_params.get(filename, {})
+        if isinstance(current, dict) and current.get("name") and not params.get("name"):
+            params["name"] = current.get("name")
+        if isinstance(current, dict) and "allow_other_outputs" in current:
+            params["allow_other_outputs"] = bool(current.get("allow_other_outputs"))
+        all_params[filename] = params
+        _save_workflow_params(all_params)
+
     def _normalize_workflow_payload(
         body: dict[str, object],
     ) -> tuple[str, dict[str, str], dict[str, object]]:
@@ -59,7 +81,15 @@ def register_workflow_routes(app: web.Application, ctx: ManagementContext) -> No
         params = body.get("params")
         if not isinstance(params, dict):
             raise TypeError("invalid params")
-        return filename, {"short": short, "detailed": detailed}, params
+        slot_edits = body.get("slot_edits")
+        if isinstance(slot_edits, list):
+            apply_workflow_slot_edits_file(workflows_dir / filename, slot_edits)
+        scanned = inspect_workflow_file(workflows_dir / filename, str(params.get("name") or "").strip())
+        if params.get("name") and isinstance(scanned, dict):
+            scanned["name"] = str(params.get("name") or "").strip()
+        if isinstance(scanned, dict):
+            scanned["allow_other_outputs"] = bool(params.get("allow_other_outputs", False))
+        return filename, {"short": short, "detailed": detailed}, scanned
 
     def _save_workflow_payload(
         filename: str, description: dict[str, str], params: dict[str, object]
@@ -97,6 +127,10 @@ def register_workflow_routes(app: web.Application, ctx: ManagementContext) -> No
                     name = str(params.get("name") or "").strip()
                 if not name:
                     continue
+                if not WORKFLOW_NAME_RE.match(name):
+                    raise ValueError(
+                        f"工作流调用名称「{name}」不合法。只能使用中文、日文、英文、数字、下划线 _、中划线 -、英文句号 . 和冒号 :"
+                    )
                 if name in seen and seen[name] != f.name:
                     raise ValueError(
                         f"工作流调用名称「{name}」重复：{seen[name]} 与 {f.name}"
@@ -109,23 +143,21 @@ def register_workflow_routes(app: web.Application, ctx: ManagementContext) -> No
         workflow_params = _load_workflow_params()
         files = []
         if workflows_dir.exists():
-            for f in sorted(workflows_dir.glob("*.json")):
-                name = f.name
-                params = (
-                    workflow_params.get(name, {})
-                    if isinstance(workflow_params, dict)
-                    else {}
-                )
+            workflows = list_workflows_in_dir(workflows_dir, workflow_params)
+            for item in sorted(workflows, key=lambda data: str(data.get("filename") or "")):
+                name = str(item.get("filename") or "")
+                params = item.get("params") if isinstance(item.get("params"), dict) else {}
                 display_name = params.get("name") if isinstance(params, dict) else ""
                 files.append(
                     {
                         "filename": name,
                         "name": display_name
-                        or (parse_workflow_filename(name) or {}).get(
-                            "name", name.removesuffix(".json")
-                        ),
+                        or item.get("name")
+                        or (parse_workflow_filename(name) or {}).get("name", name.removesuffix(".json")),
                         "description": meta.get(name, ""),
                         "params": params,
+                        "slots": params.get("slots", []) if isinstance(params, dict) else [],
+                        "inspection": params.get("inspection", {}) if isinstance(params, dict) else {},
                     }
                 )
         return web.json_response({"files": files})
@@ -156,15 +188,31 @@ def register_workflow_routes(app: web.Application, ctx: ManagementContext) -> No
             )
         workflows_dir.mkdir(parents=True, exist_ok=True)
         path = workflows_dir / filename
+        tmp_path = workflows_dir / f".{filename}.{uuid.uuid4().hex}.tmp"
         size = 0
-        with open(path, "wb") as out:
-            while True:
-                chunk = await field.read_chunk()
-                if not chunk:
-                    break
-                size += len(chunk)
-                out.write(chunk)
-        return web.json_response({"ok": True, "filename": filename, "size": size})
+        try:
+            with open(tmp_path, "wb") as out:
+                while True:
+                    chunk = await field.read_chunk()
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    out.write(chunk)
+            params = inspect_workflow_file(tmp_path, Path(filename).stem)
+            tmp_path.replace(path)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
+        _save_single_workflow_params(filename, params)
+        return web.json_response(
+            {
+                "ok": True,
+                "filename": filename,
+                "size": size,
+                "params": params,
+                "inspection": params.get("inspection", {}),
+            }
+        )
 
     async def description_handler(request: web.Request) -> web.Response:
         """Save short workflow description."""
@@ -211,6 +259,8 @@ def register_workflow_routes(app: web.Application, ctx: ManagementContext) -> No
             return web.json_response(
                 {"ok": False, "error": "invalid params"}, status=400
             )
+        params = inspect_workflow_file(workflows_dir / filename, str(params.get("name") or "").strip())
+        params["allow_other_outputs"] = bool(body.get("params", {}).get("allow_other_outputs", False))
         try:
             _validate_unique_workflow_names([(filename, {"short": "", "detailed": ""}, params)])
         except ValueError as e:
@@ -219,6 +269,74 @@ def register_workflow_routes(app: web.Application, ctx: ManagementContext) -> No
         all_params[filename] = params
         _save_workflow_params(all_params)
         return web.json_response({"ok": True})
+
+    async def workflow_slot_media_handler(request: web.Request) -> web.Response:
+        try:
+            reader = await request.multipart()
+            kind = ""
+            original_name = ""
+            content_type = ""
+            file_data = bytearray()
+            while True:
+                part = await reader.next()
+                if part is None:
+                    break
+                if part.name == "kind":
+                    kind = (await part.text()).strip().lower()
+                elif part.name == "file":
+                    original_name = _safe_basename(part.filename or "media")
+                    content_type = part.headers.get("content-type", "")
+                    while True:
+                        chunk = await part.read_chunk()
+                        if not chunk:
+                            break
+                        file_data.extend(chunk)
+                else:
+                    while await part.read_chunk():
+                        pass
+        except Exception as e:
+            return web.json_response({"ok": False, "error": f"invalid form: {e}"}, status=400)
+        if kind not in {"image", "video"}:
+            return web.json_response({"ok": False, "error": "kind must be image or video"}, status=400)
+        if not file_data:
+            return web.json_response({"ok": False, "error": "missing field: file"}, status=400)
+        if not original_name:
+            original_name = "image.png" if kind == "image" else "video.mp4"
+        suffix = Path(original_name).suffix.lower()
+        if kind == "image":
+            if suffix not in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+                return web.json_response({"ok": False, "error": "unsupported image file"}, status=400)
+            content_type = content_type or "image/png"
+            encoded = base64.b64encode(bytes(file_data)).decode("utf-8")
+            return web.json_response(
+                {
+                    "ok": True,
+                    "kind": "image",
+                    "name": original_name,
+                    "default": encoded,
+                    "preview": f"data:{content_type};base64,{encoded}",
+                    "size": len(file_data),
+                }
+            )
+        if suffix not in {".mp4", ".webm", ".mov", ".avi", ".mkv"}:
+            return web.json_response({"ok": False, "error": "unsupported video file"}, status=400)
+        stem = Path(original_name).stem or "video"
+        safe_stem = re.sub(r"[^a-zA-Z0-9_\-\+=\.\u4e00-\u9fff]+", "_", stem)[:60] or "video"
+        output_media_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"workflow_default_{uuid.uuid4().hex}_{safe_stem}{suffix}"
+        path = output_media_dir / filename
+        with path.open("wb") as out:
+            out.write(bytes(file_data))
+        size = len(file_data)
+        if not size:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return web.json_response({"ok": False, "error": "empty file"}, status=400)
+        return web.json_response(
+            {"ok": True, "kind": "video", "name": original_name, "default": filename, "size": size}
+        )
 
     async def description_detailed_handler(request: web.Request) -> web.Response:
         """Save detailed workflow description."""
@@ -362,6 +480,7 @@ def register_workflow_routes(app: web.Application, ctx: ManagementContext) -> No
     app.router.add_post("/api/description", description_handler)
     app.router.add_post("/api/description_detailed", description_detailed_handler)
     app.router.add_post("/api/workflow_params", workflow_params_handler)
+    app.router.add_post("/api/workflow_slot_media", workflow_slot_media_handler)
     app.router.add_post("/api/workflow", workflow_handler)
     app.router.add_post("/api/workflows/bulk", workflows_bulk_handler)
     app.router.add_post("/api/rename", rename_handler)

@@ -42,10 +42,10 @@ LLM 自动调用时，BOT 会：
 
 ## 目标功能（技术说明）
 
-**任意**在 ComfyUI 上能跑通的工作流，只要把「需要由 LLM/用户传入」的**文本、图片、视频**入口，换成约定好的几类节点（Simple String、ETN_LoadImageBase64、VHS_LoadVideo），即可接入 AstrBot，由 LLM 自动注入参数并执行。
+**任意**在 ComfyUI 上能跑通的工作流，只要把「需要由 LLM/用户传入」的**文本、图片、视频**入口，以及希望插件识别的输出，换成 AstrBubble 专属节点，即可接入 AstrBot，由 LLM 自动注入参数并执行。
 
-- **约定**：可注入的入口仅限上述三类节点；工作流里其他逻辑（模型、采样、ControlNet、多步推理等）一律保持原样。
-- **流程**：在 ComfyUI 中设计好工作流 → 导出 API 格式 JSON → 按规范命名（见第四节）→ 上传到本插件并填写说明，即可被 LLM 选用并调用。
+- **约定**：插件只识别 `AstrBubble_*` 专属输入/输出节点；工作流里其他逻辑（模型、采样、ControlNet、多步推理等）一律保持原样。
+- **流程**：在 ComfyUI 中设计好工作流 → 用 AstrBubble 节点标记输入输出 → 导出 API 格式 JSON → 上传到本插件并填写说明，即可被 LLM 选用并调用。
 
 ---
 
@@ -70,30 +70,42 @@ LLM 自动调用时，BOT 会：
 
 ## 二、ComfyUI 端依赖（节点与插件）
 
-本插件**只替换**工作流中以下三类节点的输入，其余节点不修改。设计工作流时请仅使用这些节点作为「可注入参数」的入口。
+本插件**只替换**工作流中的 AstrBubble 专属输入节点，并只用 AstrBubble 专属输出节点自动识别输出数量。AstrBubble ComfyUI 节点包是给 AstrBot 插件 `astrbot_plugin_comfyui_bubble` 配套使用的 ComfyUI 自定义节点：
 
-| 用途 | 节点 `class_type` | 输入键名 | 说明 | ComfyUI 插件来源 |
-|------|--------------------|----------|------|------------------|
-| **文本** | `Simple String` | `text` 或 `string` | 按顺序注入 `texts` 数组 | **[CG Use Everywhere](https://github.com/chrisgoringe/cg-use-everywhere)**（chrisgoringe） |
-| **图片** | `ETN_LoadImageBase64` | `image` | 按顺序注入 base64 字符串（PNG） | **ComfyUI Nodes for External Tooling**（如 [comfyui-tooling-nodes](https://comfyai.run/documentation/ETN_LoadImageBase64) / Acly 等），界面显示为 "Load Image (Base64)" |
-| **视频** | `VHS_LoadVideo` | `video` | 按顺序注入服务器上的视频文件名（如 .mp4） | **ComfyUI-VideoHelperSuite**（[Kosinkadink/ComfyUI-VideoHelperSuite](https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite)），界面为 "Load Video" 等 |
+- 节点包独立仓库名：`ComfyUI-AstrBubble-Nodes`
+- 安装方式：将节点包克隆或复制到 `ComfyUI/custom_nodes/ComfyUI-AstrBubble-Nodes`，然后重启 ComfyUI。
 
-- **Simple String**：来自 [CG Use Everywhere](https://github.com/chrisgoringe/cg-use-everywhere)，需安装该扩展。
-- **ETN_LoadImageBase64**：非内置，需安装 External Tooling / Base64 相关自定义节点，用于接收 base64 图参与推理。
-- **VHS_LoadVideo**：来自 VideoHelperSuite，需单独安装该扩展；若工作流不涉及视频可不安。
+节点协议如下：
+
+| 用途 | 节点 `class_type` | 关键输入键名 | 说明 |
+|------|--------------------|--------------|------|
+| 文本输入 | `AstrBubble_TextInput` | `index`, `explain`, `text` | 按 `index` 注入 `texts[index-1]` |
+| 图片输入 | `AstrBubble_ImageInput` | `index`, `explain`, `image_base64` | 按 `index` 注入 base64 图片 |
+| 视频输入 | `AstrBubble_VideoInput` | `index`, `explain`, `video` | 按 `index` 注入服务器视频文件名 |
+| 文本输出 | `AstrBubble_TextOutput` | `index`, `explain` | 用于自动识别文本输出数量 |
+| 图片输出 | `AstrBubble_ImageOutput` | `index`, `explain` | 用于自动识别图片输出数量 |
+| 视频输出 | `AstrBubble_VideoOutput` | `index`, `explain` | 用于自动识别视频输出数量 |
+
+`index` 必须是正整数，并且同类型、同方向节点必须从 1 连续编号。`explain` 是给用户和 LLM 看的槽位说明，例如「正向提示词」「负向提示词」「参考图」「首帧图」。
 
 ---
 
 ## 三、ComfyUI 工作流设计思路
 
-1. **需要传入的图片**  
-   - 在工作流中，凡是要由 LLM/用户传入的**图片**，不要用「Load Image（从路径）」等节点，改用 **ETN_LoadImageBase64**（Base64 节点）作为入口，由本插件在运行时按顺序注入 base64 数据。
+1. **需要传入的文本、图片、视频**  
+   - 凡是要由 LLM/用户传入的文本，使用 `AstrBubble_TextInput`。
+   - 凡是要由 LLM/用户传入的图片，使用 `AstrBubble_ImageInput`。
+   - 凡是要由 LLM/用户传入的视频，使用 `AstrBubble_VideoInput`。
 
-2. **需要传入的文本**  
-   - 凡是要由 LLM/用户传入的**文本**，使用 **Simple String** 节点作为前级：在需要文本的地方（如 CLIP 文本编码、提示词输入等），用 **Simple String** 的输出连过去，本插件会按顺序把 `texts` 数组注入到这些 Simple String 节点。
+2. **需要插件识别的输出**  
+   - 输出文本使用 `AstrBubble_TextOutput`。
+   - 输出图片使用 `AstrBubble_ImageOutput`。
+   - 输出视频使用 `AstrBubble_VideoOutput`。
 
 3. **顺序与数量**  
-   - 工作流中第 1 个 Simple String 对应 `texts[0]`，第 2 个对应 `texts[1]`，以此类推；图片、视频同理。输入/输出数量不再写在文件名里，而是在工作流管理页为每个工作流单独配置。
+   - 顺序由节点的 `index` 决定，而不是 JSON 中的节点顺序。
+   - 例如正向词节点设置 `index=1,explain=正向提示词`，负向词节点设置 `index=2,explain=负向提示词`，插件会把 `texts[0]` 注入正向词，把 `texts[1]` 注入负向词。
+   - 上传工作流后，插件会自动扫描 AstrBubble 节点并生成输入/输出数量；管理页不再需要手动填写数量。
 
 4. **模型与路径**  
    - 工作流内用到的模型（如 ckpt、LoRA）、路径等，需在**运行本插件的 ComfyUI 环境**中存在，否则会报错（如 `value_not_in_list`）。不同机器需各自准备好相同名称或调整工作流中的模型名。
@@ -118,35 +130,37 @@ LLM 自动调用时，BOT 会：
    - 在 ComfyUI 中配置好工作流节点并确保可运行后，选择菜单 **文件 → 导出（API）**，会生成一个 `.json` 文件。  
    - 将该 JSON 文件重命名为易读名称，例如：`改图.json`、`图生视频_720p.json`。文件名不再承载输入/输出数量。
 
-2. **上传、填写说明并配置参数**  
+2. **上传并填写说明**  
    - 打开本插件的**工作流管理页**（见 4.1），点击上传，选择重命名后的 `.json` 文件上传。  
-   - 在管理页中为该工作流输入说明文字，并配置输入/输出的文本、图片、视频数量与强/弱校验模式。  
+   - 上传后插件会自动扫描 AstrBubble 专属节点，识别输入/输出的文本、图片、视频数量。  
+   - 在管理页中为该工作流输入说明文字即可。  
    - 也可将 `.json` 直接放到 **`data/plugin_data/astrbot_plugin_comfyui_bubble/workflows/`** 目录下，再在管理页中编辑说明。
 
-3. **参数配置规则（核心）**  
-   工作流管理页中，每个工作流都可以配置输入和输出的 **文本 / 图片 / 视频**：
+3. **自动识别规则（核心）**  
+   工作流管理页中，每个工作流都会展示自动识别出的输入和输出数量：
 
-   - 数量留空：接受任意数量。  
-   - 数量填 `0`：表示该类型不应输入或不应输出。  
-   - 强校验：输入数量必须等于设置值；输出数量必须不少于设置值，少于则报错，超过则只发送前 N 个。  
-   - 弱校验：输入超过设置值时只取前 N 个，少于则按实际数量传入；输出超过设置值时只发送前 N 个，少于则按实际数量发送。  
-   - 文件名中的 `+文本N+图片N` / `=文本N` 旧规则已经移除，不再解析；如需兼容旧文件，请在 WebUI 中手动配置显示名称和参数。
+   - 数量来自 `AstrBubble_*Input` 和 `AstrBubble_*Output` 节点。
+   - 同类型节点的 `index` 必须从 1 连续编号，不能重复、跳号或为空。
+   - 输入数量按严格模式校验：识别到 2 个文本输入时，调用必须提供 2 段文本。
+   - 输出数量按严格模式校验：识别到 1 个图片输出时，任务完成后至少需要 1 个图片输出。
+   - 文件名中的 `+文本N+图片N` / `=文本N` 旧规则已经移除，不再解析。
+   - 旧的 `Simple String`、`ETN_LoadImageBase64`、`VHS_LoadVideo` 不再作为注入入口支持，请迁移为 AstrBubble 节点。
 
-   **文件名与配置示例：**
+   **文件名与节点示例：**
 
-   | 文件名 | WebUI 参数配置示例 |
+   | 文件名 | AstrBubble 节点示例 |
    |--------|--------------------|
-   | `改图.json` | 输入文本弱 1、输入图片强 1、输出图片弱 1 |
-   | `双图参考改图.json` | 输入文本弱 1、输入图片强 2、输出图片弱 1 |
-   | `文生图1比1.json` | 输入文本弱 1、输出图片弱 1 |
-   | `手办化.json` | 输入图片强 1、输出图片弱 1 |
-   | `图生视频_720p.json` | 输入文本弱 2、输入图片强 1、输出视频弱 1 |
-   | `反推提示词.json` | 输入图片强 1、输出文本强 1 |
+   | `改图.json` | `TextInput #1`、`ImageInput #1`、`ImageOutput #1` |
+   | `双图参考改图.json` | `TextInput #1`、`ImageInput #1`、`ImageInput #2`、`ImageOutput #1` |
+   | `文生图1比1.json` | `TextInput #1`、`ImageOutput #1` |
+   | `手办化.json` | `ImageInput #1`、`ImageOutput #1` |
+   | `图生视频_720p.json` | `TextInput #1`、`TextInput #2`、`ImageInput #1`、`VideoOutput #1` |
+   | `反推提示词.json` | `ImageInput #1`、`TextOutput #1` |
 
 4. **填写说明（推荐）**  
    - 在工作流管理页为每个文件填写**说明**（或直接编辑 `data/plugin_data/astrbot_plugin_comfyui_bubble/workflow_meta.json`）。  
    - 说明会通过 `/comfyui list` 和 `comfyui_list_workflows` 返回，便于用户复制工作流名，也便于 LLM 选择合适工作流。  
-   - 建议把输入/输出要求直接写进说明里，例如需要几段文本、几张图片、输出什么内容等。LLM 工具不会再额外拼接自动生成的参数摘要。
+   - 建议把每个 `explain` 对应的含义写清楚，例如 `文本1=正向提示词，文本2=负向提示词`。LLM 工具会附带自动识别到的槽位摘要。
    - `workflow_meta.json` 中仍会保存说明，例如：
      ```json
      {
@@ -176,7 +190,7 @@ LLM 自动调用时，BOT 会：
 ```
 
 - `/comfyui list`：列出当前 ComfyUI 接口允许使用的工作流。列表编号按当前过滤结果生成，可直接用编号执行。
-- `/comfyui <工作流名称或编号> ...`：提交工作流并等待 WebSocket 完成事件，用户输入文本会原样进入 Simple String 节点。
+- `/comfyui <工作流名称或编号> ...`：提交工作流并等待 WebSocket 完成事件，用户输入文本会原样进入 `AstrBubble_TextInput` 节点。
 - 多段文本使用半角 `|` 或全角 `｜` 分隔；如果工作流只接收 1 段文本，剩余内容会作为一整段文本传入。
 - 图片可直接随命令发送，也支持引用 Telegram 图片消息；若适配器能解析引用原图，插件会把引用图片作为 `图片N` 输入。
 - `/comfyui upload`：回复一条 `.json` 工作流文件后上传到工作流目录。
@@ -238,16 +252,18 @@ ws://<ComfyUI地址>/ws?clientId=<client_id>
 | **comfyui_status** | 查询 ComfyUI 队列状态（运行中/等待中数量） |
 | **/comfyui** | 手动列出、上传、执行工作流，绕过 LLM prompt 改写 |
 | **/comfyui_port** | 查看/切换当前 ComfyUI 接口 |
-| **工作流管理页** | 上传/重命名/删除工作流 JSON，编辑说明，配置多接口与工作流白名单 |
+| **工作流管理页** | 上传/重命名/删除工作流 JSON，自动识别 AstrBubble 输入输出，编辑说明，配置多接口与工作流白名单 |
 
 ---
 
 ## 六、注意事项小结
 
-- 工作流中**仅** Simple String、ETN_LoadImageBase64、VHS_LoadVideo 会被本插件替换；其他节点请勿依赖「由本插件注入」的文本/图/视频。  
-- 工作流文件名不再承载参数；请在工作流管理页配置输入/输出文本、图片、视频数量及强/弱校验模式。  
-- 数量留空表示接受任意数量；数量填 `0` 表示该类型不应输入或不应输出。  
+- 工作流中**仅** `AstrBubble_TextInput`、`AstrBubble_ImageInput`、`AstrBubble_VideoInput` 会被本插件替换。  
+- 输出数量**仅**由 `AstrBubble_TextOutput`、`AstrBubble_ImageOutput`、`AstrBubble_VideoOutput` 自动识别。  
+- 工作流文件名不再承载参数；输入/输出数量由上传后的 AstrBubble 节点扫描结果决定。  
+- 同类型、同方向 AstrBubble 节点的 `index` 必须从 1 连续编号，不能重复或跳号。  
 - 旧的 `+文本N+图片N` / `=文本N` 文件名规则已移除，不再解析。  
+- 旧的 `Simple String`、`ETN_LoadImageBase64`、`VHS_LoadVideo` 不再作为注入入口支持。  
 - 推荐安装 [astrbot_plugin_image_url_base64_to_mcp](https://github.com/Thetail001/astrbot_plugin_image_url_base64_to_mcp)，以便在「用户引用之前消息的图」时通过 `get_image_from_context` + `image_urls` 完成改图。
 - 本版本在原插件基础上修复了一些稳定性、等待机制、媒体发送与参数处理方面的问题。
 

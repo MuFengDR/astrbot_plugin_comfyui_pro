@@ -15,6 +15,279 @@ import httpx
 from astrbot.api import logger
 
 
+ASTR_BUBBLE_INPUT_NODES = {
+    "AstrBubble_TextInput": ("text", "text"),
+    "AstrBubble_ImageInput": ("image", "image_base64"),
+    "AstrBubble_VideoInput": ("video", "video"),
+}
+ASTR_BUBBLE_OUTPUT_NODES = {
+    "AstrBubble_TextOutput": ("text", None),
+    "AstrBubble_ImageOutput": ("image", None),
+    "AstrBubble_VideoOutput": ("video", None),
+}
+ASTR_BUBBLE_NODE_CLASSES = set(ASTR_BUBBLE_INPUT_NODES) | set(ASTR_BUBBLE_OUTPUT_NODES)
+SLOT_KIND_LABELS = {"text": "文本", "image": "图片", "video": "视频"}
+HIDDEN_TITLE_PREFIX = "[hide]"
+
+
+def _empty_rule(limit: Optional[int] = None) -> Dict[str, Any]:
+    return {"limit": limit, "mode": "strict"}
+
+
+def _empty_auto_params(name: str = "") -> Dict[str, Any]:
+    return {
+        "name": name,
+        "inputs": {
+            "text": _empty_rule(0),
+            "image": _empty_rule(0),
+            "video": _empty_rule(0),
+        },
+        "outputs": {
+            "text": _empty_rule(0),
+            "image": _empty_rule(0),
+            "video": _empty_rule(0),
+        },
+        "allow_other_outputs": False,
+        "slots": [],
+        "inspection": {"ok": False, "error": "未识别到 AstrBubble 专属输入/输出节点。"},
+    }
+
+
+def _iter_workflow_nodes(workflow_data: Any):
+    if isinstance(workflow_data, dict):
+        api_nodes = [
+            (str(node_id), node)
+            for node_id, node in workflow_data.items()
+            if isinstance(node, dict) and "class_type" in node
+        ]
+        if api_nodes:
+            yield from api_nodes
+            return
+        raw_nodes = workflow_data.get("nodes")
+        if isinstance(raw_nodes, list):
+            for index, node in enumerate(raw_nodes):
+                if not isinstance(node, dict):
+                    continue
+                node_id = node.get("id", index)
+                yield str(node_id), node
+
+
+def _slot_index(value: Any) -> Optional[int]:
+    try:
+        index = int(value)
+    except (TypeError, ValueError):
+        return None
+    return index if index > 0 else None
+
+
+def _validate_slot_indexes(slots: List[Dict[str, Any]]) -> List[str]:
+    errors: List[str] = []
+    groups: Dict[tuple[str, str], List[Dict[str, Any]]] = {}
+    for slot in slots:
+        if slot.get("hidden"):
+            continue
+        groups.setdefault((slot["direction"], slot["kind"]), []).append(slot)
+    for (direction, kind), items in groups.items():
+        indexes = [item["index"] for item in items]
+        duplicates = sorted({idx for idx in indexes if indexes.count(idx) > 1})
+        if duplicates:
+            errors.append(f"{direction}/{kind} index 重复：{duplicates}")
+            continue
+        expected = list(range(1, len(indexes) + 1))
+        actual = sorted(indexes)
+        if actual != expected:
+            errors.append(f"{direction}/{kind} index 必须从 1 连续编号，当前为 {actual}")
+    return errors
+
+
+def _slot_default_value(inputs: Dict[str, Any], kind: str, input_key: Optional[str]) -> str:
+    if kind == "text":
+        return str(inputs.get("text") or "")
+    if kind == "image":
+        return str(inputs.get("image_base64") or "")
+    if kind == "video":
+        return str(inputs.get("video") or "")
+    if input_key:
+        return str(inputs.get(input_key) or "")
+    return ""
+
+
+def _node_title(node: Dict[str, Any], node_id: str, class_type: str) -> str:
+    meta = node.get("_meta") if isinstance(node.get("_meta"), dict) else {}
+    title = str(meta.get("title") or node.get("title") or "").strip()
+    return title or f"{class_type} #{node_id}"
+
+
+def _is_hidden_title(title: str) -> bool:
+    return str(title or "").strip().lower().startswith(HIDDEN_TITLE_PREFIX)
+
+
+def _media_command_incompatibilities(slots: List[Dict[str, Any]]) -> List[str]:
+    warnings: List[str] = []
+    for kind in ("image", "video"):
+        media_slots = sorted(
+            [
+                slot
+                for slot in slots
+                if slot.get("direction") == "input" and slot.get("kind") == kind
+                and not slot.get("hidden")
+            ],
+            key=lambda slot: int(slot.get("index") or 0),
+        )
+        seen_optional = False
+        for slot in media_slots:
+            if slot.get("optional"):
+                seen_optional = True
+            elif seen_optional:
+                warnings.append(
+                    f"{SLOT_KIND_LABELS.get(kind, kind)}输入存在可缺省项位于必填项之前，/comfyui 命令无法可靠跳过媒体槽位。"
+                )
+                break
+    return warnings
+
+
+def inspect_workflow_slots(workflow_data: Any, name: str = "") -> Dict[str, Any]:
+    """Read AstrBubble node slots from a ComfyUI API workflow."""
+    slots: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    for node_id, node in _iter_workflow_nodes(workflow_data):
+        class_type = str(node.get("class_type") or "")
+        if class_type not in ASTR_BUBBLE_NODE_CLASSES:
+            continue
+        inputs = node.get("inputs") if isinstance(node.get("inputs"), dict) else {}
+        index = _slot_index(inputs.get("index"))
+        if index is None:
+            errors.append(f"节点 {node_id}({class_type}) 缺少正整数 index")
+            continue
+        explain = str(inputs.get("explain") or "").strip()
+        if class_type in ASTR_BUBBLE_INPUT_NODES:
+            kind, input_key = ASTR_BUBBLE_INPUT_NODES[class_type]
+            direction = "input"
+        else:
+            kind, input_key = ASTR_BUBBLE_OUTPUT_NODES[class_type]
+            direction = "output"
+        title = _node_title(node, node_id, class_type)
+        slots.append(
+            {
+                "direction": direction,
+                "kind": kind,
+                "index": index,
+                "node_id": node_id,
+                "class_type": class_type,
+                "title": title,
+                "hidden": _is_hidden_title(title),
+                "explain": explain,
+                "input_key": input_key,
+                "optional": bool(inputs.get("optional", False)),
+                "enabled": bool(inputs.get("enabled", True)) if direction == "output" else True,
+                "default": _slot_default_value(inputs, kind, input_key) if direction == "input" else "",
+            }
+        )
+    errors.extend(_validate_slot_indexes(slots))
+    command_warnings = _media_command_incompatibilities(slots)
+    params = _empty_auto_params(name)
+    params["slots"] = sorted(
+        slots,
+        key=lambda item: (
+            item["direction"],
+            item["kind"],
+            bool(item.get("hidden")),
+            item["index"],
+            item["node_id"],
+        ),
+    )
+    for direction, group_name in (("input", "inputs"), ("output", "outputs")):
+        for kind in ("text", "image", "video"):
+            count = len(
+                [
+                    slot
+                    for slot in slots
+                    if slot["direction"] == direction and slot["kind"] == kind
+                    and not slot.get("hidden")
+                ]
+            )
+            params[group_name][kind] = _empty_rule(count)
+    if not slots:
+        errors.append("未识别到 AstrBubble 专属输入/输出节点。")
+    params["inspection"] = {
+        "ok": not errors,
+        "error": "；".join(errors),
+        "command_compatible": not command_warnings,
+        "command_warning": "；".join(command_warnings),
+    }
+    return params
+
+
+def apply_workflow_slot_edits(workflow_data: Any, slot_edits: List[Dict[str, Any]]) -> Any:
+    """Apply safe AstrBubble slot edits to a ComfyUI workflow JSON object."""
+    if not slot_edits:
+        return workflow_data
+    edits_by_node = {
+        str(edit.get("node_id") or ""): edit
+        for edit in slot_edits
+        if isinstance(edit, dict) and str(edit.get("node_id") or "")
+    }
+    if not edits_by_node:
+        return workflow_data
+    for node_id, node in _iter_workflow_nodes(workflow_data):
+        edit = edits_by_node.get(str(node_id))
+        if not edit or not isinstance(node, dict):
+            continue
+        class_type = str(node.get("class_type") or "")
+        if class_type in ASTR_BUBBLE_INPUT_NODES:
+            direction = "input"
+            kind, input_key = ASTR_BUBBLE_INPUT_NODES[class_type]
+        elif class_type in ASTR_BUBBLE_OUTPUT_NODES:
+            direction = "output"
+            kind, input_key = ASTR_BUBBLE_OUTPUT_NODES[class_type]
+        else:
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            inputs = {}
+            node["inputs"] = inputs
+        if "index" in edit:
+            index = _slot_index(edit.get("index"))
+            if index is None:
+                raise ValueError(f"节点 {node_id}({class_type}) index 必须是正整数")
+            inputs["index"] = index
+        if "explain" in edit:
+            inputs["explain"] = str(edit.get("explain") or "").strip()
+            inputs.pop("label", None)
+        inputs["optional"] = bool(edit.get("optional", False))
+        if direction == "output":
+            inputs["enabled"] = bool(edit.get("enabled", True))
+            continue
+        if kind == "text" and "default" in edit:
+            inputs["text"] = str(edit.get("default") or "")
+        elif kind == "image" and "default" in edit:
+            inputs["image_base64"] = str(edit.get("default") or "")
+        elif kind == "video" and "default" in edit:
+            inputs["video"] = str(edit.get("default") or "")
+        elif input_key and "default" in edit and kind not in ("image", "video"):
+            inputs[input_key] = str(edit.get("default") or "")
+    inspected = inspect_workflow_slots(workflow_data)
+    if not inspected.get("inspection", {}).get("ok", False):
+        raise ValueError(inspected.get("inspection", {}).get("error") or "输入槽位配置无效")
+    return workflow_data
+
+
+def inspect_workflow_file(filepath: Path, name: str = "") -> Dict[str, Any]:
+    try:
+        data = json.loads(filepath.read_text(encoding="utf-8"))
+    except Exception as e:
+        params = _empty_auto_params(name)
+        params["inspection"] = {"ok": False, "error": f"工作流 JSON 读取失败：{e}"}
+        return params
+    return inspect_workflow_slots(data, name)
+
+
+def apply_workflow_slot_edits_file(filepath: Path, slot_edits: List[Dict[str, Any]]) -> None:
+    data = json.loads(filepath.read_text(encoding="utf-8"))
+    apply_workflow_slot_edits(data, slot_edits)
+    filepath.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def parse_workflow_filename(filename: str) -> Optional[Dict[str, Any]]:
     """
     解析工作流文件名，仅提取默认工作流名称。
@@ -53,7 +326,7 @@ def _normalize_workflow_params(raw: Any) -> Dict[str, Any]:
         raw = {}
     inputs = raw.get("inputs") if isinstance(raw.get("inputs"), dict) else {}
     outputs = raw.get("outputs") if isinstance(raw.get("outputs"), dict) else {}
-    return {
+    normalized = {
         "name": str(raw.get("name") or "").strip(),
         "inputs": {
             "text": _normalize_rule(inputs.get("text")),
@@ -65,7 +338,17 @@ def _normalize_workflow_params(raw: Any) -> Dict[str, Any]:
             "image": _normalize_rule(outputs.get("image")),
             "video": _normalize_rule(outputs.get("video")),
         },
+        "allow_other_outputs": bool(raw.get("allow_other_outputs", False)),
     }
+    normalized["slots"] = raw.get("slots") if isinstance(raw.get("slots"), list) else []
+    inspection = raw.get("inspection") if isinstance(raw.get("inspection"), dict) else {}
+    normalized["inspection"] = {
+        "ok": bool(inspection.get("ok", True)),
+        "error": str(inspection.get("error") or "").strip(),
+        "command_compatible": bool(inspection.get("command_compatible", True)),
+        "command_warning": str(inspection.get("command_warning") or "").strip(),
+    }
+    return normalized
 
 
 def _build_workflow_info(filename: str, params: Any = None) -> Dict[str, Any]:
@@ -93,11 +376,52 @@ def _input_rule_matches(count: int, rule: Dict[str, Any]) -> bool:
     return True
 
 
+def _input_slots_for_kind(info: Dict[str, Any], kind: str) -> List[Dict[str, Any]]:
+    params = info.get("params") if isinstance(info.get("params"), dict) else {}
+    slots = params.get("slots") if isinstance(params.get("slots"), list) else []
+    return sorted(
+        [
+            slot
+            for slot in slots
+            if isinstance(slot, dict)
+            and slot.get("direction") == "input"
+            and slot.get("kind") == kind
+            and not slot.get("hidden")
+        ],
+        key=lambda slot: int(slot.get("index") or 0),
+    )
+
+
+def _slot_values_match(values: List[Any], slots: List[Dict[str, Any]]) -> bool:
+    if len(values) > len(slots):
+        return False
+    for idx, slot in enumerate(slots):
+        provided = idx < len(values) and str(values[idx] or "").strip() != ""
+        if not provided and not bool(slot.get("optional", False)):
+            return False
+    return True
+
+
 def _input_match_score(count: int, rule: Dict[str, Any]) -> int:
     limit = rule.get("limit")
     if limit is None:
         return 0
     return abs(count - limit)
+
+
+def _params_for_workflow_file(
+    filepath: Path, workflow_params: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    saved = (workflow_params or {}).get(filepath.name)
+    saved_name = ""
+    if isinstance(saved, dict):
+        saved_name = str(saved.get("name") or "").strip()
+    scanned = inspect_workflow_file(filepath, saved_name)
+    if isinstance(saved, dict) and saved_name:
+        scanned["name"] = saved_name
+    if isinstance(saved, dict) and "allow_other_outputs" in saved:
+        scanned["allow_other_outputs"] = bool(saved.get("allow_other_outputs"))
+    return scanned
 
 
 def list_workflows_in_dir(workflow_dir: Path, workflow_params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
@@ -106,7 +430,7 @@ def list_workflows_in_dir(workflow_dir: Path, workflow_params: Optional[Dict[str
     if not workflow_dir.exists():
         return workflows
     for f in workflow_dir.glob("*.json"):
-        workflows.append(_build_workflow_info(f.name, (workflow_params or {}).get(f.name)))
+        workflows.append(_build_workflow_info(f.name, _params_for_workflow_file(f, workflow_params)))
     return workflows
 
 
@@ -123,15 +447,21 @@ def find_workflow_file(
         return None
     candidates = []
     for f in workflow_dir.glob("*.json"):
-        info = _build_workflow_info(f.name, (workflow_params or {}).get(f.name))
+        info = _build_workflow_info(f.name, _params_for_workflow_file(f, workflow_params))
         if not info or info["name"] != workflow_name:
             continue
         params = info.get("params") or {}
+        inspection = params.get("inspection") if isinstance(params.get("inspection"), dict) else {}
+        if not inspection.get("ok", True):
+            continue
         inputs = params.get("inputs") or {}
+        text_slots = _input_slots_for_kind(info, "text")
+        image_slots = _input_slots_for_kind(info, "image")
+        video_slots = _input_slots_for_kind(info, "video")
         if (
-            _input_rule_matches(text_count, inputs.get("text", {}))
-            and _input_rule_matches(image_count, inputs.get("image", {}))
-            and _input_rule_matches(video_count, inputs.get("video", {}))
+            (text_slots and _slot_values_match(["x"] * text_count, text_slots) or not text_slots and _input_rule_matches(text_count, inputs.get("text", {})))
+            and (image_slots and _slot_values_match(["x"] * image_count, image_slots) or not image_slots and _input_rule_matches(image_count, inputs.get("image", {})))
+            and (video_slots and _slot_values_match(["x"] * video_count, video_slots) or not video_slots and _input_rule_matches(video_count, inputs.get("video", {})))
         ):
             score = (
                 _input_match_score(text_count, inputs.get("text", {}))
@@ -196,22 +526,35 @@ class ComfyUIWorkflow:
             self._processing = False
 
     def _replace_base64_images(self, data: Any, base64_images: List[str]) -> Tuple[Any, int]:
-        """仅替换 class_type 为 ETN_LoadImageBase64 的节点（界面标题 Load Image (Base64)），传入 base64 到其 image 输入。其他一律不修改。"""
-        counter = {"count": 0}
+        """Replace AstrBubble image input nodes by their explicit index."""
+        replaced = {"count": 0}
+        inspected = inspect_workflow_slots(data)
+        slots = _input_slots_for_kind({"params": inspected}, "image")
 
         def replace(d: Any) -> Any:
             if isinstance(d, dict):
                 new_data = dict(d)
                 inputs_modified = False
-                if (
-                    new_data.get("class_type") == "ETN_LoadImageBase64"
-                    and counter["count"] < len(base64_images)
+                if new_data.get("class_type") == "AstrBubble_ImageInput" and not _is_hidden_title(
+                    _node_title(new_data, "", "AstrBubble_ImageInput")
                 ):
-                    if "inputs" in new_data and isinstance(new_data["inputs"], dict) and "image" in new_data["inputs"]:
-                        new_data["inputs"] = dict(new_data["inputs"])
-                        new_data["inputs"]["image"] = base64_images[counter["count"]]
-                        counter["count"] += 1
+                    inputs = new_data.get("inputs") if isinstance(new_data.get("inputs"), dict) else {}
+                    index = _slot_index(inputs.get("index"))
+                    if index is not None and index <= len(base64_images):
+                        value = str(base64_images[index - 1] or "")
+                        if not value.strip():
+                            slot = next((s for s in slots if s.get("index") == index), {})
+                            if slot.get("optional"):
+                                return new_data
+                            raise ValueError(f"缺少必填输入：[图片{index}] {inputs.get('explain') or ''}".strip())
+                        new_data["inputs"] = dict(inputs)
+                        new_data["inputs"]["image_base64"] = value
+                        replaced["count"] += 1
                         inputs_modified = True
+                    elif index is not None:
+                        slot = next((s for s in slots if s.get("index") == index), {})
+                        if not slot.get("optional"):
+                            raise ValueError(f"缺少必填输入：[图片{index}] {inputs.get('explain') or ''}".strip())
                 for k, v in d.items():
                     if k == "inputs" and inputs_modified:
                         continue
@@ -221,29 +564,37 @@ class ComfyUIWorkflow:
                 return [replace(x) for x in d]
             return d
 
-        return replace(data), counter["count"]
+        return replace(data), replaced["count"]
 
     def _replace_video_nodes(self, data: Any, video_filenames: List[str]) -> Tuple[Any, int]:
-        if not video_filenames:
-            return data, 0
-        counter = {"count": 0}
-        broadcast = len(video_filenames) == 1
+        replaced = {"count": 0}
+        inspected = inspect_workflow_slots(data)
+        slots = _input_slots_for_kind({"params": inspected}, "video")
 
         def replace(d: Any) -> Any:
             if isinstance(d, dict):
                 new_data = dict(d)
                 inputs_modified = False
-                if new_data.get("class_type") == "VHS_LoadVideo":
-                    if "inputs" in new_data and isinstance(new_data["inputs"], dict) and "video" in new_data["inputs"]:
-                        new_data["inputs"] = dict(new_data["inputs"])
-                        if broadcast:
-                            new_data["inputs"]["video"] = video_filenames[0]
-                            counter["count"] += 1
-                            inputs_modified = True
-                        elif counter["count"] < len(video_filenames):
-                            new_data["inputs"]["video"] = video_filenames[counter["count"]]
-                            counter["count"] += 1
-                            inputs_modified = True
+                if new_data.get("class_type") == "AstrBubble_VideoInput" and not _is_hidden_title(
+                    _node_title(new_data, "", "AstrBubble_VideoInput")
+                ):
+                    inputs = new_data.get("inputs") if isinstance(new_data.get("inputs"), dict) else {}
+                    index = _slot_index(inputs.get("index"))
+                    if index is not None and index <= len(video_filenames):
+                        value = str(video_filenames[index - 1] or "")
+                        if not value.strip():
+                            slot = next((s for s in slots if s.get("index") == index), {})
+                            if slot.get("optional"):
+                                return new_data
+                            raise ValueError(f"缺少必填输入：[视频{index}] {inputs.get('explain') or ''}".strip())
+                        new_data["inputs"] = dict(inputs)
+                        new_data["inputs"]["video"] = value
+                        replaced["count"] += 1
+                        inputs_modified = True
+                    elif index is not None:
+                        slot = next((s for s in slots if s.get("index") == index), {})
+                        if not slot.get("optional"):
+                            raise ValueError(f"缺少必填输入：[视频{index}] {inputs.get('explain') or ''}".strip())
                 for k, v in d.items():
                     if k == "inputs" and inputs_modified:
                         continue
@@ -253,18 +604,21 @@ class ComfyUIWorkflow:
                 return [replace(x) for x in d]
             return d
 
-        return replace(data), counter["count"]
+        return replace(data), replaced["count"]
 
     def _count_text_nodes(self, data: Any) -> int:
-        """仅统计 Simple String 节点（inputs 含 text 或 string）。其他类型一律不计入。"""
+        """Count AstrBubble text input nodes."""
         count = 0
 
         def walk(d: Any) -> None:
             nonlocal count
             if isinstance(d, dict):
-                if d.get("class_type") == "Simple String" and isinstance(d.get("inputs"), dict):
-                    if "text" in d["inputs"] or "string" in d["inputs"]:
-                        count += 1
+                if (
+                    d.get("class_type") == "AstrBubble_TextInput"
+                    and isinstance(d.get("inputs"), dict)
+                    and not _is_hidden_title(_node_title(d, "", "AstrBubble_TextInput"))
+                ):
+                    count += 1
                 for v in d.values():
                     walk(v)
             elif isinstance(d, list):
@@ -286,31 +640,36 @@ class ComfyUIWorkflow:
         return result
 
     def _update_text_nodes(self, data: Any, texts: List[str]) -> Tuple[Any, int]:
-        """仅按顺序替换 Simple String 节点（text 或 string 输入）。其他类型一律不修改。"""
-        slots = self._count_text_nodes(data)
-        merged = self._smart_merge_texts(texts, slots)
-        counter = {"count": 0}
+        """Replace AstrBubble text input nodes by their explicit index."""
+        replaced = {"count": 0}
+        inspected = inspect_workflow_slots(data)
+        slots = _input_slots_for_kind({"params": inspected}, "text")
 
         def replace(d: Any) -> Any:
             if isinstance(d, dict):
                 new_data = dict(d)
                 inputs_modified = False
-                if (
-                    new_data.get("class_type") == "Simple String"
-                    and counter["count"] < len(merged)
+                if new_data.get("class_type") == "AstrBubble_TextInput" and not _is_hidden_title(
+                    _node_title(new_data, "", "AstrBubble_TextInput")
                 ):
-                    if "inputs" in new_data and isinstance(new_data["inputs"], dict):
-                        new_data["inputs"] = dict(new_data["inputs"])
-                        if "text" in new_data["inputs"]:
-                            new_data["inputs"]["text"] = merged[counter["count"]]
-                            counter["count"] += 1
-                            inputs_modified = True
-                        elif "string" in new_data["inputs"]:
-                            new_data["inputs"]["string"] = merged[counter["count"]]
-                            counter["count"] += 1
-                            inputs_modified = True
+                    inputs = new_data.get("inputs") if isinstance(new_data.get("inputs"), dict) else {}
+                    index = _slot_index(inputs.get("index"))
+                    if index is not None and index <= len(texts):
+                        value = str(texts[index - 1] or "")
+                        if not value.strip():
+                            slot = next((s for s in slots if s.get("index") == index), {})
+                            if slot.get("optional"):
+                                return new_data
+                            raise ValueError(f"缺少必填输入：[文本{index}] {inputs.get('explain') or ''}".strip())
+                        new_data["inputs"] = dict(inputs)
+                        new_data["inputs"]["text"] = value
+                        replaced["count"] += 1
+                        inputs_modified = True
+                    elif index is not None:
+                        slot = next((s for s in slots if s.get("index") == index), {})
+                        if not slot.get("optional"):
+                            raise ValueError(f"缺少必填输入：[文本{index}] {inputs.get('explain') or ''}".strip())
                 for k, v in d.items():
-                    # 若已在本层修改过 inputs，不要用 replace(v) 覆盖，否则会还原为空
                     if k == "inputs" and inputs_modified:
                         continue
                     new_data[k] = replace(v)
@@ -320,13 +679,13 @@ class ComfyUIWorkflow:
             return d
 
         result = replace(data)
-        if counter["count"] > 0 and texts:
+        if replaced["count"] > 0 and texts:
             logger.info(
-                "[ComfyUI] Replaced %d Simple String node(s) with prompt: %s",
-                counter["count"],
+                "[ComfyUI] Replaced %d AstrBubble text input node(s) with prompt: %s",
+                replaced["count"],
                 texts[0][:80] + ("..." if len(texts[0]) > 80 else ""),
             )
-        return result, counter["count"]
+        return result, replaced["count"]
 
     def _randomize_seeds(self, data: Any) -> Any:
         if isinstance(data, dict):
@@ -379,12 +738,9 @@ class ComfyUIWorkflow:
         extract_text: bool,
     ) -> Tuple[Optional[str], str, List[str]]:
         workflow_api_modified = json.loads(json.dumps(self.workflow_api))
-        if base64_images:
-            workflow_api_modified, _ = self._replace_base64_images(workflow_api_modified, base64_images)
-        if videos:
-            workflow_api_modified, _ = self._replace_video_nodes(workflow_api_modified, videos)
-        if texts:
-            workflow_api_modified, _ = self._update_text_nodes(workflow_api_modified, texts)
+        workflow_api_modified, _ = self._replace_base64_images(workflow_api_modified, base64_images)
+        workflow_api_modified, _ = self._replace_video_nodes(workflow_api_modified, videos)
+        workflow_api_modified, _ = self._update_text_nodes(workflow_api_modified, texts)
         workflow_api_modified = self._randomize_seeds(workflow_api_modified)
 
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -411,21 +767,18 @@ class ComfyUIWorkflow:
         """
         workflow_api_modified = json.loads(json.dumps(self.workflow_api))
         text_slots = self._count_text_nodes(workflow_api_modified)
-        if base64_images:
-            workflow_api_modified, img_count = self._replace_base64_images(workflow_api_modified, base64_images)
-            if debug:
-                logger.info("[ComfyUI Debug] Replaced %d ETN_LoadImageBase64 node(s) with %d image(s)", img_count, len(base64_images))
-        if videos:
-            workflow_api_modified, _ = self._replace_video_nodes(workflow_api_modified, videos)
-        if texts:
-            workflow_api_modified, replaced = self._update_text_nodes(workflow_api_modified, texts)
-            if debug:
-                logger.info(
-                    "[ComfyUI Debug] Simple String slots in workflow: %d, replaced: %d, texts passed: %s",
-                    text_slots,
-                    replaced,
-                    texts,
-                )
+        workflow_api_modified, img_count = self._replace_base64_images(workflow_api_modified, base64_images)
+        if debug:
+            logger.info("[ComfyUI Debug] Replaced %d AstrBubble image input node(s) with %d image(s)", img_count, len(base64_images))
+        workflow_api_modified, _ = self._replace_video_nodes(workflow_api_modified, videos)
+        workflow_api_modified, replaced = self._update_text_nodes(workflow_api_modified, texts)
+        if debug:
+            logger.info(
+                "[ComfyUI Debug] AstrBubble text slots in workflow: %d, replaced: %d, texts passed: %s",
+                text_slots,
+                replaced,
+                texts,
+            )
         workflow_api_modified = self._randomize_seeds(workflow_api_modified)
         if debug:
             try:

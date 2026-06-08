@@ -2,11 +2,14 @@
 """Workflow metadata and input/output rule helpers."""
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..workflow_engine import list_workflows_in_dir
 from .paths import META_PATH, PLUGIN_DATA_DIR, WORKFLOWS_DIR
+
+WORKFLOW_NAME_RE = re.compile(r"^[\u4e00-\u9fff\u3040-\u30ffA-Za-z0-9_.:-]+$")
 
 
 def _ensure_workflows_dir() -> None:
@@ -39,7 +42,7 @@ def _load_workflow_meta() -> Dict[str, Any]:
 
 def _load_workflow_text_slots() -> Dict[str, List[str]]:
     """
-    从 workflow_meta.json 读取 filename -> 文本槽位说明列表（与工作流中 Simple String 节点顺序一致）。
+    从 workflow_meta.json 读取 filename -> 文本槽位说明列表（兼容旧元数据）。
     用于 list_workflows 时告知 LLM 每个 text 的用途，例如 ["正面提示词", "负面提示词"] 或 ["修改说明"]。
     """
     if not META_PATH.exists():
@@ -80,6 +83,23 @@ def _get_configured_workflow_info(workflow_dir: Path, filename: str, workflow_pa
     return None
 
 
+def _workflow_availability_error(workflow: Dict[str, Any], workflows: Optional[List[Dict[str, Any]]] = None) -> str:
+    params = workflow.get("params") if isinstance(workflow.get("params"), dict) else {}
+    inspection = params.get("inspection") if isinstance(params.get("inspection"), dict) else {}
+    if not inspection.get("ok", True):
+        return str(inspection.get("error") or "工作流未通过 AstrBubble 节点扫描。")
+    name = str(workflow.get("name") or params.get("name") or "").strip()
+    if not name:
+        return "缺少工作流调用名称。"
+    if not WORKFLOW_NAME_RE.match(name):
+        return "工作流调用名称不合法。只能使用中文、日文、英文、数字、下划线 _、中划线 -、英文句号 . 和冒号 :"
+    return ""
+
+
+def _workflow_is_available(workflow: Dict[str, Any], workflows: Optional[List[Dict[str, Any]]] = None) -> bool:
+    return _workflow_availability_error(workflow, workflows) == ""
+
+
 def _apply_input_rule(values: List[Any], rule: Dict[str, Any], label: str) -> tuple[bool, List[Any], str]:
     limit = rule.get("limit") if isinstance(rule, dict) else None
     mode = rule.get("mode") if isinstance(rule, dict) else "loose"
@@ -94,12 +114,63 @@ def _apply_input_rule(values: List[Any], rule: Dict[str, Any], label: str) -> tu
     return True, values, ""
 
 
+def _slot_label(kind: str, index: object, explain: object = "") -> str:
+    kind_text = {"text": "文本", "image": "图片", "video": "视频"}.get(str(kind), str(kind))
+    suffix = f" {explain}" if str(explain or "").strip() else ""
+    return f"[{kind_text}{index}]{suffix}"
+
+
+def _apply_slot_input_rule(values: List[Any], slots: List[Dict[str, Any]], kind: str) -> tuple[bool, List[Any], str]:
+    if not slots:
+        return True, values, ""
+    slots = sorted(slots, key=lambda slot: int(slot.get("index") or 0))
+    provided_count = sum(1 for item in values if str(item or "").strip())
+    if len(values) > len(slots):
+        return False, values, f"{kind}输入最多 {len(slots)} 个，当前提供 {provided_count} 个。"
+    messages: List[str] = []
+    for idx, slot in enumerate(slots):
+        raw = values[idx] if idx < len(values) else ""
+        provided = str(raw or "").strip() != ""
+        if not provided and not bool(slot.get("optional", False)):
+            messages.append(f"缺少必填输入：{_slot_label(slot.get('kind'), slot.get('index'), slot.get('explain'))}。")
+    if messages:
+        return False, values, " ".join(messages)
+    return True, values, ""
+
+
+def _workflow_input_slots(params: Dict[str, Any], kind: str) -> List[Dict[str, Any]]:
+    slots = params.get("slots") if isinstance(params.get("slots"), list) else []
+    return [
+        slot
+        for slot in slots
+        if isinstance(slot, dict)
+        and slot.get("direction") == "input"
+        and slot.get("kind") == kind
+        and not slot.get("hidden")
+    ]
+
+
 def _apply_workflow_input_rules(info: Dict[str, Any], texts: List[str], images: List[str], videos: List[str]) -> tuple[bool, List[str], List[str], List[str], str]:
     params = info.get("params") if isinstance(info.get("params"), dict) else {}
     inputs = params.get("inputs") if isinstance(params.get("inputs"), dict) else {}
-    ok_texts, texts, msg_texts = _apply_input_rule(texts, inputs.get("text", {}), "文本")
-    ok_images, images, msg_images = _apply_input_rule(images, inputs.get("image", {}), "图片")
-    ok_videos, videos, msg_videos = _apply_input_rule(videos, inputs.get("video", {}), "视频")
+    text_slots = _workflow_input_slots(params, "text")
+    image_slots = _workflow_input_slots(params, "image")
+    video_slots = _workflow_input_slots(params, "video")
+    ok_texts, texts, msg_texts = (
+        _apply_slot_input_rule(texts, text_slots, "文本")
+        if text_slots
+        else _apply_input_rule(texts, inputs.get("text", {}), "文本")
+    )
+    ok_images, images, msg_images = (
+        _apply_slot_input_rule(images, image_slots, "图片")
+        if image_slots
+        else _apply_input_rule(images, inputs.get("image", {}), "图片")
+    )
+    ok_videos, videos, msg_videos = (
+        _apply_slot_input_rule(videos, video_slots, "视频")
+        if video_slots
+        else _apply_input_rule(videos, inputs.get("video", {}), "视频")
+    )
     messages = [m for m in (msg_texts, msg_images, msg_videos) if m]
     return ok_texts and ok_images and ok_videos, texts, images, videos, " ".join(messages)
 
@@ -107,22 +178,29 @@ def _apply_workflow_input_rules(info: Dict[str, Any], texts: List[str], images: 
 def _workflow_input_mismatch_message(
     workflow_name: str,
     candidates: List[Dict[str, Any]],
-    text_count: int,
-    image_count: int,
-    video_count: int,
+    texts: Any,
+    images: Any,
+    videos: Any,
 ) -> str:
     details: List[str] = []
-    sample_texts = [""] * text_count
-    sample_images = [""] * image_count
-    sample_videos = [""] * video_count
+    text_values = list(texts or []) if not isinstance(texts, int) else [""] * texts
+    image_values = list(images or []) if not isinstance(images, int) else [""] * images
+    video_values = list(videos or []) if not isinstance(videos, int) else [""] * videos
+    text_count = sum(1 for item in text_values if str(item or "").strip())
+    image_count = sum(1 for item in image_values if str(item or "").strip())
+    video_count = sum(1 for item in video_values if str(item or "").strip())
     for item in candidates:
+        params = item.get("params") if isinstance(item.get("params"), dict) else {}
+        inspection = params.get("inspection") if isinstance(params.get("inspection"), dict) else {}
+        if not inspection.get("ok", True):
+            details.append(f"- {inspection.get('error') or '工作流未通过 AstrBubble 节点扫描。'}")
+            continue
         ok, _, _, _, msg = _apply_workflow_input_rules(
-            item, list(sample_texts), list(sample_images), list(sample_videos)
+            item, list(text_values), list(image_values), list(video_values)
         )
         if ok:
             continue
-        filename = item.get("filename") or "workflow.json"
-        details.append(f"- {filename}: {msg or '输入数量不符合该工作流设置。'}")
+        details.append(f"- {msg or '输入数量不符合该工作流设置。'}")
     suffix = ("\n" + "\n".join(details)) if details else ""
     return (
         f"工作流「{workflow_name}」存在，但入参数量不符合条件。"
@@ -184,5 +262,7 @@ __all__ = [
     "_load_workflow_params",
     "_load_workflow_text_slots",
     "_save_workflow_meta",
+    "_workflow_availability_error",
     "_workflow_input_mismatch_message",
+    "_workflow_is_available",
 ]

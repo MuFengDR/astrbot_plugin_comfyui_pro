@@ -20,10 +20,10 @@ from .models import (
     public_record,
 )
 from .providers.baidu import BaiduImageAuditProvider
-from .providers.placeholder import PlaceholderAuditProvider
 
 
-IMAGE_PROVIDERS = {"placeholder", "baidu_icr"}
+DEFAULT_IMAGE_PROVIDER = "baidu_icr"
+IMAGE_PROVIDERS = {DEFAULT_IMAGE_PROVIDER}
 TEST_IMAGE_PNG = (
     "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAfUlEQVR4nNXOMREAIADEsFL/"
     "dn9HBAPXKMjZRpnESZzESZzESZzESZzESZzESZzESZzESZzESZzESZzESZzESZzESZzE"
@@ -38,7 +38,6 @@ class ContentAuditService:
         self.audit_dir = self.plugin_data_dir / "media" / "audit"
         self.records_path = self.audit_dir / "audit_records.json"
         self.settings_path = self.audit_dir / "audit_settings.json"
-        self.provider = PlaceholderAuditProvider()
 
     def _ensure_dir(self) -> None:
         self.audit_dir.mkdir(parents=True, exist_ok=True)
@@ -46,18 +45,18 @@ class ContentAuditService:
     def default_settings(self) -> Dict[str, Any]:
         return {
             "enabled": True,
-            "provider": self.provider.name,
-            "providers": {"image": self.provider.name, "video": "", "text": ""},
+            "provider": DEFAULT_IMAGE_PROVIDER,
+            "providers": {"image": DEFAULT_IMAGE_PROVIDER, "video": "", "text": ""},
             "baidu_icr": {"api_key": "", "secret_key": ""},
             "fail_policy": "allow",
             "send_policy": default_send_policy(),
         }
 
     def _normalize_providers(self, value: Any, fallback: str = "") -> Dict[str, str]:
-        image = fallback if fallback in IMAGE_PROVIDERS else self.provider.name
+        image = fallback if fallback in IMAGE_PROVIDERS else DEFAULT_IMAGE_PROVIDER
         if isinstance(value, dict):
             candidate = str(value.get("image") or image).strip()
-            image = candidate if candidate in IMAGE_PROVIDERS else self.provider.name
+            image = candidate if candidate in IMAGE_PROVIDERS else DEFAULT_IMAGE_PROVIDER
         return {"image": image, "video": "", "text": ""}
 
     def _normalize_baidu_settings(self, value: Any, current: Dict[str, Any] | None = None) -> Dict[str, str]:
@@ -87,7 +86,7 @@ class ContentAuditService:
         except Exception as e:
             logger.warning("ComfyUI content audit settings read failed: %s", e)
         settings["enabled"] = bool(settings.get("enabled", True))
-        legacy_provider = str(settings.get("provider") or self.provider.name).strip()
+        legacy_provider = str(settings.get("provider") or DEFAULT_IMAGE_PROVIDER).strip()
         settings["providers"] = self._normalize_providers(settings.get("providers"), legacy_provider)
         settings["provider"] = settings["providers"]["image"]
         settings["baidu_icr"] = self._normalize_baidu_settings(settings.get("baidu_icr"))
@@ -125,7 +124,7 @@ class ContentAuditService:
         return self._public_settings(current)
 
     def _image_provider_for_settings(self, settings: Dict[str, Any]) -> Any:
-        provider_name = str((settings.get("providers") or {}).get("image") or settings.get("provider") or "placeholder")
+        provider_name = str((settings.get("providers") or {}).get("image") or settings.get("provider") or DEFAULT_IMAGE_PROVIDER)
         if provider_name == "baidu_icr":
             baidu = settings.get("baidu_icr") if isinstance(settings.get("baidu_icr"), dict) else {}
             return BaiduImageAuditProvider(
@@ -133,7 +132,7 @@ class ContentAuditService:
                 api_key=str(baidu.get("api_key") or ""),
                 secret_key=str(baidu.get("secret_key") or ""),
             )
-        return self.provider
+        return BaiduImageAuditProvider(self.plugin_data_dir)
 
     def _settings_with_payload(self, payload: Dict[str, Any] | None) -> Dict[str, Any]:
         current = self.load_settings()
@@ -162,14 +161,7 @@ class ContentAuditService:
 
     async def test_image_provider(self, payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
         settings = self._settings_with_payload(payload)
-        provider_name = str((settings.get("providers") or {}).get("image") or settings.get("provider") or "placeholder")
-        if provider_name == "placeholder":
-            return {
-                "ok": True,
-                "provider": "placeholder",
-                "message": "占位审核器可用，但不会进行真实内容识别。",
-                "result": {"status": "unknown", "reason": "placeholder"},
-            }
+        provider_name = str((settings.get("providers") or {}).get("image") or settings.get("provider") or DEFAULT_IMAGE_PROVIDER)
         provider = self._image_provider_for_settings(settings)
         self._ensure_dir()
         test_path = self.audit_dir / "baidu_icr_test.png"
@@ -227,6 +219,22 @@ class ContentAuditService:
             return "block"
         return normalize_fail_policy(settings.get("fail_policy"), "allow")
 
+    def _audit_state_for_record(self, status: str, decision: str) -> str:
+        if decision == "block" or status == "block":
+            return "audit_hit"
+        if status == "pass":
+            return "audit_pass"
+        if status in {"error", "unknown"}:
+            return "audit_error"
+        return "audit_disabled"
+
+    def _send_method_for_audit_state(self, settings: Dict[str, Any], audit_state: str, media_type: str = "image") -> str:
+        policy = normalize_send_policy(settings.get("send_policy"))
+        method = str((policy.get(audit_state) or {}).get(media_type) or "direct").strip().lower()
+        if method == "obfuscated" and media_type != "image":
+            return "direct"
+        return method if method in {"direct", "obfuscated", "none"} else "direct"
+
     async def audit_images_for_task(self, task: Dict[str, Any], images: List[str]) -> Dict[str, Any]:
         origin = str(task.get("origin") or "")
         if origin not in {"command", "llm_tool"} or not images:
@@ -250,11 +258,13 @@ class ContentAuditService:
                     "categories": [],
                     "scores": {},
                     "reason": f"审核执行失败：{e}",
-                    "provider": getattr(image_provider, "name", self.provider.name),
+                    "provider": getattr(image_provider, "name", DEFAULT_IMAGE_PROVIDER),
                     "raw": {},
                 }
             status = normalize_status(result.get("status"))
             decision = self._decision_for_status(status, settings)
+            audit_state = self._audit_state_for_record(status, decision)
+            send_method = self._send_method_for_audit_state(settings, audit_state, "image")
             record = {
                 "id": new_record_id(),
                 "task_id": str(task.get("task_id") or ""),
@@ -270,11 +280,13 @@ class ContentAuditService:
                 "thumbnail": image_url,
                 "status": status,
                 "decision": decision,
-                "sent": decision != "block",
+                "audit_state": audit_state,
+                "send_method": send_method,
+                "sent": send_method != "none",
                 "reason": str(result.get("reason") or ""),
                 "categories": result.get("categories") or [],
                 "scores": result.get("scores") or {},
-                "provider": result.get("provider") or getattr(image_provider, "name", self.provider.name),
+                "provider": result.get("provider") or getattr(image_provider, "name", DEFAULT_IMAGE_PROVIDER),
                 "manual": False,
                 "created_at": now_ts(),
                 "updated_at": now_ts(),
@@ -323,67 +335,6 @@ class ContentAuditService:
                 "error": sum(1 for r in records if r.get("status") == "error"),
             },
         }
-
-    def manual_review(self, record_id: str, decision: str, reason: str = "") -> Dict[str, Any]:
-        decision = "block" if str(decision or "").strip() == "block" else "allow"
-        records = self._read_records()
-        for record in records:
-            if str(record.get("id") or "") == str(record_id or ""):
-                record["decision"] = decision
-                record["status"] = "block" if decision == "block" else "pass"
-                record["sent"] = bool(record.get("sent")) if decision == "allow" else False
-                record["manual"] = True
-                record["reason"] = reason or ("人工拦截" if decision == "block" else "人工通过")
-                record["updated_at"] = now_ts()
-                self._write_records(records)
-                return {"ok": True, "record": public_record(record)}
-        return {"ok": False, "error": "审核记录不存在。"}
-
-    async def retry(self, record_id: str) -> Dict[str, Any]:
-        records = self._read_records()
-        for record in records:
-            if str(record.get("id") or "") == str(record_id or ""):
-                task = {
-                    "task_id": record.get("task_id"),
-                    "prompt_id": record.get("prompt_id"),
-                    "origin": record.get("origin"),
-                    "origin_label": record.get("origin_label"),
-                    "session_label": record.get("session_label"),
-                    "workflow_name": record.get("workflow_name"),
-                    "workflow_file": record.get("workflow_file"),
-                    "port_name": record.get("port_name"),
-                }
-                settings = self.load_settings()
-                image_provider = self._image_provider_for_settings(settings)
-                try:
-                    result = await image_provider.audit_image(str(record.get("image_url") or ""), {"task": task, "retry": True})
-                except Exception as e:
-                    result = {
-                        "status": "error",
-                        "categories": [],
-                        "scores": {},
-                        "reason": f"审核执行失败：{e}",
-                        "provider": getattr(image_provider, "name", self.provider.name),
-                        "raw": {},
-                    }
-                status = normalize_status(result.get("status"))
-                decision = self._decision_for_status(status, settings)
-                record.update(
-                    {
-                        "status": status,
-                        "decision": decision,
-                        "reason": str(result.get("reason") or ""),
-                        "categories": result.get("categories") or [],
-                        "scores": result.get("scores") or {},
-                        "provider": result.get("provider") or getattr(image_provider, "name", self.provider.name),
-                        "manual": False,
-                        "updated_at": now_ts(),
-                        "raw": result.get("raw") or {},
-                    }
-                )
-                self._write_records(records)
-                return {"ok": True, "record": public_record(record)}
-        return {"ok": False, "error": "审核记录不存在。"}
 
     def remove_task_records(self, task_id: str) -> None:
         task_id = str(task_id or "")

@@ -8,6 +8,7 @@ from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool, ToolExecResult
 from astrbot.core.astr_agent_context import AstrAgentContext
 
+from ..commands.comfyui import _format_workflow_input_requirements
 from ..core import plugin as runtime
 
 
@@ -32,24 +33,22 @@ class ComfyUIListWorkflowsTool(FunctionTool[AstrAgentContext]):
             return "插件配置不可用。"
         server_ip, _ = runtime._get_server_config(config)
         active_port = runtime._get_active_comfyui_port(config)
-        descriptions = await runtime._load_workflow_descriptions(config)
         wf_dir = runtime._get_workflow_dir()
         workflows = runtime._filter_workflows_for_port(runtime._list_workflows_in_configured_dir(wf_dir), active_port)
+        workflows = [w for w in workflows if runtime._workflow_is_available(w, workflows)]
         if not workflows:
             return f"当前 ComfyUI 接口「{active_port['name']}」没有可用工作流。请使用 /comfyui_port 切换接口，或调整该接口的可用工作流配置。"
         
-        # 返回工作流名称和简短说明
-        lines = [f"Current ComfyUI: {active_port['name']} ({server_ip})", "Available workflows:"]
+        lines = [
+            f"Current ComfyUI: {active_port['name']} ({server_ip})",
+            "调用规则：texts、image_urls、videos 均按编号顺序传入；跳过可缺省输入时必须传空字符串占位，例如 texts:[\"正向词\", \"\", \"赛博朋克\"] 或 image_urls:[\"\", \"https://...\"]。",
+            "Available workflows:",
+        ]
         for w in workflows:
             name = w["name"]
-            filename = w.get("filename", "")
-            # 取简短说明
-            desc_data = descriptions.get(filename, {})
-            if isinstance(desc_data, dict):
-                short_desc = desc_data.get("short", "") or "(无说明)"
-            else:
-                short_desc = str(desc_data)[:50] if desc_data else "(无说明)"
-            lines.append(f"- {name}: {short_desc}")
+            lines.append("")
+            lines.append(f"Workflow: {name}")
+            lines.append(_format_workflow_input_requirements(w))
         
         return "\n".join(lines)
 
