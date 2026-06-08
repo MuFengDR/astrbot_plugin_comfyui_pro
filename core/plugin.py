@@ -3274,7 +3274,7 @@ class ComfyUIPlugin(Star):
             for idx, w in enumerate(command_workflows, start=1):
                 if idx > 1:
                     lines.append("")
-                lines.append(f"『{idx}』 > {w['name']} ")
+                lines.append(f"『{idx}』{w['name']}")
                 lines.append("```")
                 lines.extend(_escape_telegram_code_block_text(_format_workflow_input_requirements(w)).splitlines())
                 lines.append("```")
