@@ -14,6 +14,7 @@ from .models import (
     default_send_policy,
     new_record_id,
     normalize_fail_policy,
+    normalize_send_method,
     normalize_send_policy,
     normalize_status,
     now_ts,
@@ -230,10 +231,7 @@ class ContentAuditService:
 
     def _send_method_for_audit_state(self, settings: Dict[str, Any], audit_state: str, media_type: str = "image") -> str:
         policy = normalize_send_policy(settings.get("send_policy"))
-        method = str((policy.get(audit_state) or {}).get(media_type) or "direct").strip().lower()
-        if method == "obfuscated" and media_type != "image":
-            return "direct"
-        return method if method in {"direct", "obfuscated", "none"} else "direct"
+        return normalize_send_method((policy.get(audit_state) or {}).get(media_type), media_type)
 
     async def audit_images_for_task(self, task: Dict[str, Any], images: List[str]) -> Dict[str, Any]:
         origin = str(task.get("origin") or "")
@@ -282,7 +280,7 @@ class ContentAuditService:
                 "decision": decision,
                 "audit_state": audit_state,
                 "send_method": send_method,
-                "sent": send_method != "none",
+                "sent": send_method != "dont_send",
                 "reason": str(result.get("reason") or ""),
                 "categories": result.get("categories") or [],
                 "scores": result.get("scores") or {},

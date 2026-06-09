@@ -47,8 +47,10 @@ class ComfyUIQueryWaitTool(FunctionTool[AstrAgentContext]):
     description = (
         "Wait for ComfyUI WebSocket completion events and return task results. "
         "Pass session_tag and optionally task_ids/count. Do not pass a wait time; "
-        "timeout is configured by websocket_wait_timeout_seconds. Images and videos are handled by the plugin. "
-        "If a video result is returned as queued_by_plugin/auto_sent, do NOT call send_message_to_user; reply with normal text only."
+        "timeout is configured by websocket_wait_timeout_seconds. "
+        "When image/video results are completed, the plugin queues them for automatic sending. "
+        "Do NOT call send_message_to_user with image_url/video_url, do NOT use markdown media URLs, "
+        "and do NOT ask the user to open a URL. Reply with normal text only; the plugin will attach/send media automatically."
     )
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
@@ -297,25 +299,14 @@ class ComfyUIQueryWaitTool(FunctionTool[AstrAgentContext]):
                                 }
                             )
 
-        completed_tasks = []
         pending_count = 0
         canceled_count = 0
         for r in results:
             if isinstance(r, dict):
-                if r.get("status") == "completed" and r.get("type") == "image" and r.get("url", "").startswith("http"):
-                    completed_tasks.append(r)
-                elif r.get("status") == "pending":
+                if r.get("status") == "pending":
                     pending_count += 1
                 elif r.get("status") == "canceled":
                     canceled_count += 1
-
-        for task in completed_tasks:
-            url = task.get("url", "")
-            if url and url.startswith("http"):
-                local_path = await runtime._download_url_to_local(url)
-                if local_path and local_path != url:
-                    task["local_path"] = local_path
-                    task["url"] = local_path
 
         response = {
             "results": results,
@@ -329,174 +320,6 @@ class ComfyUIQueryWaitTool(FunctionTool[AstrAgentContext]):
         if pending_count > 0:
             response["message"] = f"{pending_count} task(s) still pending. Call comfyui_query_wait again to check."
 
-        return runtime.json.dumps(response, ensure_ascii=False, indent=2)
-        
-        # 批量查询多个任务
-        results = []
-        completed_tasks = []
-        for task_id in task_ids_arg:
-            pending = runtime._task_registry.get(task_id)
-            if not pending:
-                results.append({"task_id": task_id, "status": "error", "message": "not found in registry"})
-                continue
-            
-            pending = dict(pending)
-            task_session_key = pending.get("session_key") or session_key
-            task_session_tag = pending.get("session_tag", "")
-            prompt_id = pending.get("prompt_id")
-            task_server_ip = pending.get("server_ip") or server_ip
-            
-            if not prompt_id or not task_server_ip:
-                results.append({"task_id": task_id, "status": "error", "message": "invalid task data"})
-                continue
-            
-            remaining = await runtime._estimate_remaining_seconds(task_server_ip, prompt_id)
-            
-            if remaining == 0:
-                # 任务完成
-                url, ftype, texts = await runtime._get_result_for_prompt(task_server_ip, prompt_id, output_rules)
-                texts = runtime._filter_generated_texts_for_delivery(texts)
-                # 清理
-                for k in list(runtime._session_pending.keys()):
-                    if runtime._session_pending.get(k) and runtime._session_pending.get(k).get("prompt_id") == prompt_id:
-                        runtime._session_pending.pop(k, None)
-                runtime._task_registry.pop(prompt_id, None)
-                # 从 session_tag_tasks 中移除
-                if task_session_tag and task_session_tag in runtime._session_tag_tasks:
-                    if prompt_id in runtime._session_tag_tasks[task_session_tag]:
-                        runtime._session_tag_tasks[task_session_tag].remove(prompt_id)
-                
-                if url:
-                    extra = (" Text: " + "; ".join(texts)) if texts else ""
-                    if ftype == "image":
-                        if url:
-                            runtime._session_image_url_queue.setdefault(task_session_key, []).append(url)
-                            results.append({
-                                "task_id": prompt_id,
-                                "status": "completed",
-                                "type": "image",
-                                "url": url,
-                                "description": extra.strip()
-                            })
-                    elif ftype == "video":
-                        runtime._session_video_url_queue.setdefault(task_session_key, []).append(url)
-                        results.append({
-                            "task_id": prompt_id,
-                            "status": "completed",
-                            "type": "video",
-                            "auto_sent": True,
-                            "delivery": "queued_by_plugin",
-                            "message": "Video is queued for automatic sending. Do NOT call send_message_to_user. Reply with normal text only.",
-                            "description": extra.strip()
-                        })
-                    else:
-                        results.append({
-                            "task_id": prompt_id,
-                            "status": "completed",
-                            "type": ftype,
-                            "url": url,
-                            "description": extra.strip()
-                        })
-                else:
-                    results.append({
-                        "task_id": prompt_id,
-                        "status": "completed",
-                        "message": "no output file"
-                    })
-            elif remaining < wait_threshold:
-                # 等待时间不长，直接等待完成
-                client_id = pending.get("client_id", "")
-                url, ftype, texts = await runtime._wait_for_completion(task_server_ip, client_id, prompt_id, timeout=remaining + 120, output_rules=output_rules)
-                texts = runtime._filter_generated_texts_for_delivery(texts)
-                # 清理
-                for k in list(runtime._session_pending.keys()):
-                    if runtime._session_pending.get(k) and runtime._session_pending.get(k).get("prompt_id") == prompt_id:
-                        runtime._session_pending.pop(k, None)
-                runtime._task_registry.pop(prompt_id, None)
-                # 从 session_tag_tasks 中移除
-                if task_session_tag and task_session_tag in runtime._session_tag_tasks:
-                    if prompt_id in runtime._session_tag_tasks[task_session_tag]:
-                        runtime._session_tag_tasks[task_session_tag].remove(prompt_id)
-                
-                if url:
-                    extra = (" Text: " + "; ".join(texts)) if texts else ""
-                    if ftype == "image":
-                        if url:
-                            runtime._session_image_url_queue.setdefault(task_session_key, []).append(url)
-                            results.append({
-                                "task_id": prompt_id,
-                                "status": "completed",
-                                "type": "image",
-                                "url": url,
-                                "description": extra.strip()
-                            })
-                    elif ftype == "video":
-                        runtime._session_video_url_queue.setdefault(task_session_key, []).append(url)
-                        results.append({
-                            "task_id": prompt_id,
-                            "status": "completed",
-                            "type": "video",
-                            "auto_sent": True,
-                            "delivery": "queued_by_plugin",
-                            "message": "Video is queued for automatic sending. Do NOT call send_message_to_user. Reply with normal text only.",
-                            "description": extra.strip()
-                        })
-                    else:
-                        results.append({
-                            "task_id": prompt_id,
-                            "status": "completed",
-                            "type": ftype,
-                            "url": url,
-                            "description": extra.strip()
-                        })
-                else:
-                    results.append({
-                        "task_id": prompt_id,
-                        "status": "completed",
-                        "message": "no output file"
-                    })
-            else:
-                # 仍在队列中
-                results.append({
-                    "task_id": prompt_id,
-                    "status": "pending",
-                    "message": f"still in queue, estimated ~{remaining} seconds"
-                })
-        
-        # 收集所有已完成任务的图片URL，准备下载到本地
-        completed_tasks = []
-        pending_count = 0
-        for r in results:
-            if isinstance(r, dict):
-                if r.get("status") == "completed" and r.get("type") == "image" and r.get("url", "").startswith("http"):
-                    completed_tasks.append(r)
-                elif r.get("status") == "pending":
-                    pending_count += 1
-            else:
-                if "still in queue" in str(r):
-                    pending_count += 1
-        
-        # 下载所有远程图片到本地
-        for task in completed_tasks:
-            url = task.get("url", "")
-            if url and url.startswith("http"):
-                local_path = await runtime._download_url_to_local(url)
-                if local_path and local_path != url:
-                    task["local_path"] = local_path
-                    task["url"] = local_path  # 替换为本地路径
-        
-        # 返回 JSON 格式
-        response = {
-            "results": results,
-            "summary": {
-                "total": len(results),
-                "completed": len(results) - pending_count,
-                "pending": pending_count
-            }
-        }
-        if pending_count > 0:
-            response["message"] = f"{pending_count} task(s) still in queue. Call comfyui_query_wait again to check."
-        
         return runtime.json.dumps(response, ensure_ascii=False, indent=2)
 
 

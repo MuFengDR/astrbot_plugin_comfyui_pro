@@ -54,28 +54,28 @@ class ComfyUIStatusTool(FunctionTool[AstrAgentContext]):
                         runtime._session_image_url_queue.setdefault(session_key, []).extend(images)
                     if videos:
                         runtime._session_video_url_queue.setdefault(session_key, []).extend(videos)
-                    placeholders = runtime.COMFYUI_IMAGE_PLACEHOLDER * len(images)
-                    video_text = " Video is queued for automatic sending." if videos else ""
-                    return f"Task completed. Output: {ftype}. {placeholders}{video_text} Queue: 0 running, 0 pending."
+                    media_text = " Media is queued for automatic sending by the plugin. Reply with normal text only." if (images or videos) else ""
+                    return f"Task completed. Output: {ftype}.{media_text} Queue: 0 running, 0 pending."
                 if url:
                     if ftype == "image":
                         if runtime._is_local_image_url(url, server_ip):
                             runtime._session_image_url_queue.setdefault(session_key, []).append(url)
                             return (
-                                f"Task completed. Output: image. In your reply you MUST include exactly this placeholder to show the result image: {COMFYUI_IMAGE_PLACEHOLDER}. "
-                                "Do not use any URL or markdown image. Example: '完成！" + runtime.COMFYUI_IMAGE_PLACEHOLDER + " 这是手办化效果。' Queue: 0 running, 0 pending."
+                                "Task completed. Output: image. Image is queued for automatic sending by the plugin. "
+                                "Do NOT call send_message_to_user with image_url, do NOT use a markdown image URL. "
+                                "Reply with normal text only. Queue: 0 running, 0 pending."
                             )
                         session_id = runtime._get_session_id_from_context(context.context)
                         if session_id:
                             await runtime._send_image_to_session(session_id, url, "图好了～")
-                        return f"Task completed. Output: image. Image has been sent to the user. IMAGE_URL: {url} Queue: 0 running, 0 pending."
+                        return "Task completed. Output: image. Image has been sent to the user. Queue: 0 running, 0 pending."
                     if ftype == "video":
                         runtime._session_video_url_queue.setdefault(session_key, []).append(url)
                         return (
-                            f"Task completed. Output: video. Do NOT call send_message_to_user for this video (it will become voice). "
-                            f"In your reply you MUST include only text containing {COMFYUI_VIDEO_PLACEHOLDER}; the plugin will send the video as a separate message. Queue: 0 running, 0 pending."
+                            "Task completed. Output: video. Video is queued for automatic sending by the plugin. "
+                            "Do NOT call send_message_to_user with video_url. Reply with normal text only. Queue: 0 running, 0 pending."
                         )
-                    return f"Task completed. Output: {ftype}. URL: {url} Queue: 0 running, 0 pending."
+                    return f"Task completed. Output: {ftype}. Queue: 0 running, 0 pending."
                 return "Task completed (no output file). Queue: 0 running, 0 pending."
             if remaining < wait_threshold:
                 client_id = pending.get("client_id", "")
@@ -94,28 +94,28 @@ class ComfyUIStatusTool(FunctionTool[AstrAgentContext]):
                         runtime._session_image_url_queue.setdefault(session_key, []).extend(images)
                     if videos:
                         runtime._session_video_url_queue.setdefault(session_key, []).extend(videos)
-                    placeholders = runtime.COMFYUI_IMAGE_PLACEHOLDER * len(images)
-                    video_text = " Video is queued for automatic sending." if videos else ""
-                    return f"Task completed. Output: {ftype}. {placeholders}{video_text} Queue: 0 running, 0 pending."
+                    media_text = " Media is queued for automatic sending by the plugin. Reply with normal text only." if (images or videos) else ""
+                    return f"Task completed. Output: {ftype}.{media_text} Queue: 0 running, 0 pending."
                 if url:
                     if ftype == "image":
                         if runtime._is_local_image_url(url, server_ip):
                             runtime._session_image_url_queue.setdefault(session_key, []).append(url)
                             return (
-                                f"Task completed. Output: image. In your reply you MUST include exactly this placeholder to show the result image: {COMFYUI_IMAGE_PLACEHOLDER}. "
-                                "Do not use any URL or markdown image. Example: '完成！" + runtime.COMFYUI_IMAGE_PLACEHOLDER + " 这是手办化效果。' Queue: 0 running, 0 pending."
+                                "Task completed. Output: image. Image is queued for automatic sending by the plugin. "
+                                "Do NOT call send_message_to_user with image_url, do NOT use a markdown image URL. "
+                                "Reply with normal text only. Queue: 0 running, 0 pending."
                             )
                         session_id = runtime._get_session_id_from_context(context.context)
                         if session_id:
                             await runtime._send_image_to_session(session_id, url, "图好了～")
-                        return f"Task completed. Output: image. Image has been sent to the user. IMAGE_URL: {url} Queue: 0 running, 0 pending."
+                        return "Task completed. Output: image. Image has been sent to the user. Queue: 0 running, 0 pending."
                     if ftype == "video":
                         runtime._session_video_url_queue.setdefault(session_key, []).append(url)
                         return (
-                            f"Task completed. Output: video. Do NOT call send_message_to_user for this video (it will become voice). "
-                            f"In your reply you MUST include only text containing {COMFYUI_VIDEO_PLACEHOLDER}; the plugin will send the video as a separate message. Queue: 0 running, 0 pending."
+                            "Task completed. Output: video. Video is queued for automatic sending by the plugin. "
+                            "Do NOT call send_message_to_user with video_url. Reply with normal text only. Queue: 0 running, 0 pending."
                         )
-                    return f"Task completed. Output: {ftype}. URL: {url} Queue: 0 running, 0 pending."
+                    return f"Task completed. Output: {ftype}. Queue: 0 running, 0 pending."
                 return "Task finished. Queue: 0 running, 0 pending."
             await runtime.asyncio.sleep(wait_threshold)
             running, pending_count = await runtime._get_queue_status(server_ip)

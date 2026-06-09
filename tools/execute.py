@@ -21,7 +21,11 @@ class ComfyUIExecuteTool(FunctionTool[AstrAgentContext]):
     """
 
     name: str = "comfyui_execute"
-    description: str = "Execute a ComfyUI workflow task."
+    description: str = (
+        "Execute a ComfyUI workflow task. After submitting, you MUST immediately call comfyui_query_wait "
+        "with the returned task_id/session_tag and must not reply to the user before waiting for the result. "
+        "Generated media will be sent automatically by the plugin after comfyui_query_wait completes."
+    )
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",

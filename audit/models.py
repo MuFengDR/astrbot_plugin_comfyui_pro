@@ -12,19 +12,33 @@ AUDIT_STATUSES = {"pass", "block", "unknown", "error"}
 AUDIT_FAIL_POLICIES = {"allow", "block"}
 AUDIT_SEND_STATES = ("audit_disabled", "audit_error", "audit_hit", "audit_pass")
 AUDIT_MEDIA_TYPES = ("text", "image", "video")
+# 策略名将同步给 LLM，新增策略请保证名称含义清晰、准确。
 AUDIT_SEND_METHODS = {
-    "direct",
-    "obfuscated",
-    "none",
+    "direct_send",
+    "obfuscated_send",
+    "dont_send",
+}
+LEGACY_AUDIT_SEND_METHODS = {
+    "direct": "direct_send",
+    "obfuscated": "obfuscated_send",
+    "none": "dont_send",
 }
 
 
+def normalize_send_method(value: Any, media_type: str = "image") -> str:
+    method = str(value or "").strip().lower()
+    method = LEGACY_AUDIT_SEND_METHODS.get(method, method)
+    if method == "obfuscated_send" and media_type != "image":
+        return "direct_send"
+    return method if method in AUDIT_SEND_METHODS else "direct_send"
+
+
 def default_send_policy() -> Dict[str, Dict[str, str]]:
-    direct = {media_type: "direct" for media_type in AUDIT_MEDIA_TYPES}
+    direct = {media_type: "direct_send" for media_type in AUDIT_MEDIA_TYPES}
     return {
         "audit_disabled": dict(direct),
         "audit_error": dict(direct),
-        "audit_hit": {"text": "direct", "image": "obfuscated", "video": "none"},
+        "audit_hit": {"text": "direct_send", "image": "obfuscated_send", "video": "dont_send"},
         "audit_pass": dict(direct),
     }
 
@@ -56,9 +70,7 @@ def normalize_send_policy(value: Any) -> Dict[str, Dict[str, str]]:
         if not isinstance(source_row, dict):
             continue
         for media_type in AUDIT_MEDIA_TYPES:
-            method = str(source_row.get(media_type) or "").strip().lower()
-            if method in AUDIT_SEND_METHODS and (method != "obfuscated" or media_type == "image"):
-                policy[state][media_type] = method
+            policy[state][media_type] = normalize_send_method(source_row.get(media_type), media_type)
     return policy
 
 

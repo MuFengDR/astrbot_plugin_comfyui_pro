@@ -9,6 +9,7 @@ import json
 import os
 import tempfile
 import time
+from urllib.parse import parse_qs, urlparse
 import uuid
 
 import aiohttp
@@ -65,6 +66,7 @@ from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.utils.quoted_message import extract_quoted_message_images
 
 from ..audit import ContentAuditService
+from ..audit.models import default_send_policy, normalize_send_method, normalize_send_policy
 from ..workflow_engine import (
     ComfyUIWorkflow,
     find_workflow_file,
@@ -447,28 +449,12 @@ def _obfuscate_image_file(image_path: str) -> Optional[str]:
 
 
 def _load_send_policy() -> Dict[str, Dict[str, str]]:
-    default_row = {"text": "direct", "image": "direct", "video": "direct"}
-    default_policy = {
-        "audit_disabled": dict(default_row),
-        "audit_error": dict(default_row),
-        "audit_hit": {"text": "direct", "image": "obfuscated", "video": "none"},
-        "audit_pass": dict(default_row),
-    }
+    default_policy = default_send_policy()
     try:
         if _task_service and hasattr(_task_service, "get_audit_settings"):
             result = _task_service.get_audit_settings()
             settings = result.get("settings") if isinstance(result, dict) else {}
-            policy = settings.get("send_policy") if isinstance(settings, dict) else {}
-            if isinstance(policy, dict):
-                for state_key, row in policy.items():
-                    if state_key not in default_policy or not isinstance(row, dict):
-                        continue
-                    for media_type, method in row.items():
-                        if media_type not in default_policy[state_key]:
-                            continue
-                        method = str(method or "").strip().lower()
-                        if method in {"direct", "none"} or (media_type == "image" and method == "obfuscated"):
-                            default_policy[state_key][media_type] = method
+            default_policy = normalize_send_policy(settings.get("send_policy") if isinstance(settings, dict) else {})
     except Exception as e:
         logger.debug("ComfyUI load send policy failed: %s", e)
     return default_policy
@@ -477,10 +463,7 @@ def _load_send_policy() -> Dict[str, Dict[str, str]]:
 def _resolve_send_method(media_type: str, audit_state: str = "audit_disabled") -> str:
     media_type = media_type if media_type in {"text", "image", "video"} else "image"
     audit_state = audit_state if audit_state in {"audit_disabled", "audit_error", "audit_hit", "audit_pass"} else "audit_disabled"
-    method = _load_send_policy().get(audit_state, {}).get(media_type, "direct")
-    if method == "obfuscated" and media_type != "image":
-        return "direct"
-    return method if method in {"direct", "none", "obfuscated"} else "direct"
+    return normalize_send_method(_load_send_policy().get(audit_state, {}).get(media_type), media_type)
 
 
 def _audit_state_from_record(record: Optional[Dict[str, Any]]) -> str:
@@ -501,7 +484,7 @@ def _normalize_media_delivery_item(item: Any, media_type: str) -> Dict[str, Any]
     if isinstance(item, dict):
         url = str(item.get("url") or item.get("image_url") or item.get("video_url") or "")
         audit_state = str(item.get("audit_state") or "audit_disabled")
-        method = str(item.get("send_method") or _resolve_send_method(media_type, audit_state))
+        method = normalize_send_method(item.get("send_method") or _resolve_send_method(media_type, audit_state), media_type)
         notice = str(item.get("notice") or "")
         return {"url": url, "audit_state": audit_state, "send_method": method, "notice": notice}
     url = str(item or "")
@@ -519,34 +502,125 @@ def _delivery_items_for_urls(media_type: str, urls: List[str], audit_records: Op
     for url in [str(u) for u in urls if u]:
         record = records_by_url.get(url)
         audit_state = str((record or {}).get("audit_state") or _audit_state_from_record(record))
-        method = str((record or {}).get("send_method") or _resolve_send_method(media_type, audit_state)).strip().lower()
-        if method == "obfuscated" and media_type != "image":
-            method = "direct"
-        if method not in {"direct", "none", "obfuscated"}:
-            method = "direct"
+        method = normalize_send_method((record or {}).get("send_method") or _resolve_send_method(media_type, audit_state), media_type)
         notice = ""
-        if method == "none":
+        if method == "dont_send":
             notice = "内容已生成，但按发送策略未发送。"
         items.append({"url": url, "audit_state": audit_state, "send_method": method, "notice": notice})
     return items
 
 
+def _is_queued_send_method(method: str) -> bool:
+    return normalize_send_method(method, "image") != "dont_send"
+
+
+def _filename_from_media_url(url: str) -> str:
+    raw = str(url or "")
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+        filename = (parse_qs(parsed.query).get("filename") or [""])[0]
+        if filename:
+            return Path(filename).name
+        return Path(parsed.path).name or Path(raw).name
+    except Exception:
+        return Path(raw).name
+
+
+def _build_media_delivery_report(media_type: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    groups: Dict[tuple[str, str, bool], Dict[str, Any]] = {}
+    for item in items:
+        method = normalize_send_method(item.get("send_method"), media_type)
+        audit_state = str(item.get("audit_state") or "audit_disabled")
+        queued = method != "dont_send"
+        key = (audit_state, method, queued)
+        group = groups.setdefault(
+            key,
+            {
+                "audit_state": audit_state,
+                "send_method": method,
+                "queued": queued,
+                "count": 0,
+                "files": [],
+            },
+        )
+        group["count"] += 1
+        filename = _filename_from_media_url(str(item.get("url") or ""))
+        if filename:
+            group["files"].append(filename)
+    ordered_groups = sorted(
+        groups.values(),
+        key=lambda group: (
+            {"audit_disabled": 0, "audit_pass": 1, "audit_hit": 2, "audit_error": 3}.get(group["audit_state"], 9),
+            group["send_method"],
+            not group["queued"],
+        ),
+    )
+    queued_count = sum(1 for item in items if normalize_send_method(item.get("send_method"), media_type) != "dont_send")
+    return {
+        "generated_count": len(items),
+        "local_path": str(_get_comfyui_output_image_dir().resolve()),
+        "queued_count": queued_count,
+        "skipped_count": max(0, len(items) - queued_count),
+        "groups": ordered_groups,
+    }
+
+
+def _llm_media_delivery_message(media_label: str = "Media") -> str:
+    return (
+        f"{media_label} is queued for automatic sending by the plugin. "
+        "Do NOT call send_message_to_user with image_url/video_url. "
+        "Reply with normal text only; the plugin will attach/send the media automatically."
+    )
+
+
+def _llm_image_delivery_report_message(report: Dict[str, Any]) -> str:
+    generated_count = int(report.get("generated_count") or 0)
+    queued_count = int(report.get("queued_count") or 0)
+    if queued_count <= 0:
+        return "Image generated, but automatic sending was skipped or blocked."
+    return (
+        f"Image generation completed: {generated_count} generated, {queued_count} queued for automatic sending. "
+        "In media_delivery_report.image.groups, queued=true means the plugin will automatically send that group; "
+        "queued=false means it will not be sent. Do NOT call send_message_to_user with image_url/video_url. "
+        "Reply with normal text only; the plugin will attach/send the media automatically."
+    )
+
+
+def _llm_media_delivery_message_from_report(
+    image_report: Dict[str, Any],
+    video_sendable_count: int,
+) -> str:
+    image_sendable_count = int(image_report.get("queued_count") or 0)
+    generated_count = int(image_report.get("generated_count") or 0)
+    if image_sendable_count <= 0 and video_sendable_count <= 0:
+        return "Media generated, but automatic sending was skipped or blocked."
+    return (
+        f"Media generation completed: {generated_count} image(s) generated, {image_sendable_count} image(s) queued for automatic sending. "
+        "In media_delivery_report.image.groups, queued=true means the plugin will automatically send that group; "
+        "queued=false means it will not be sent. Do NOT call send_message_to_user with image_url/video_url. "
+        "Reply with normal text only; the plugin will attach/send media automatically."
+    )
+
+
+
 def _filter_generated_texts_for_delivery(texts: List[str]) -> List[str]:
-    if _resolve_send_method("text", "audit_disabled") == "none":
+    if _resolve_send_method("text", "audit_disabled") == "dont_send":
         return []
     return texts
 
 
 async def _prepare_image_delivery_for_send(item: Any, session_key: str) -> tuple[Optional[str], Optional[str]]:
     delivery = _normalize_media_delivery_item(item, "image")
-    method = delivery.get("send_method") or "direct"
+    method = delivery.get("send_method") or "direct_send"
     image_url = delivery.get("url") or ""
-    if method == "none":
+    if method == "dont_send":
         return None, delivery.get("notice") or "图片已生成，但按发送策略未发送。"
     temp_path = await _download_image_to_temp(image_url) if image_url else None
     if not temp_path or not Path(temp_path).exists():
         return None, "图片已生成，但下载失败，未发送。"
-    if method == "obfuscated":
+    if method == "obfuscated_send":
         obfuscated_path = _obfuscate_image_file(temp_path)
         if not obfuscated_path or not Path(obfuscated_path).exists():
             return None, "图片混淆失败，未发送。"
@@ -557,9 +631,9 @@ async def _prepare_image_delivery_for_send(item: Any, session_key: str) -> tuple
 
 async def _prepare_video_delivery_for_send(item: Any) -> tuple[Optional[str], Optional[str]]:
     delivery = _normalize_media_delivery_item(item, "video")
-    method = delivery.get("send_method") or "direct"
+    method = delivery.get("send_method") or "direct_send"
     video_url = delivery.get("url") or ""
-    if method == "none":
+    if method == "dont_send":
         return None, delivery.get("notice") or "视频已生成，但按发送策略未发送。"
     video_temp_path = await _download_media_to_temp(video_url, ".mp4") if video_url else None
     if not video_temp_path or not Path(video_temp_path).exists():
@@ -680,12 +754,12 @@ async def _send_image_to_session(session_id: str, image_url: str, plain_text: Op
     temp_path = None
     try:
         method = _resolve_send_method("image", "audit_disabled")
-        if method == "none":
+        if method == "dont_send":
             return await _send_plain_to_session(session_id, "图片已生成，但按发送策略未发送。")
         temp_path = await _download_image_to_temp(image_url)
         if not temp_path or not Path(temp_path).exists():
             return False
-        if method == "obfuscated":
+        if method == "obfuscated_send":
             obfuscated_path = _obfuscate_image_file(temp_path)
             if not obfuscated_path or not Path(obfuscated_path).exists():
                 await _send_plain_to_session(session_id, "图片混淆失败，未发送。")
@@ -1363,30 +1437,39 @@ async def _append_completed_task_result(
             except Exception as e:
                 logger.warning("ComfyUI content audit failed: %s", e)
         image_delivery_items = _delivery_items_for_urls("image", delivery_images, audit_result.get("records") or [])
-        sendable_image_count = sum(1 for item in image_delivery_items if item.get("send_method") != "none")
+        image_report = _build_media_delivery_report("image", image_delivery_items)
+        sendable_image_count = int(image_report.get("queued_count") or 0)
         if image_delivery_items:
             _session_image_url_queue.setdefault(task_session_key, []).extend(image_delivery_items)
-        video_method = _resolve_send_method("video", "audit_disabled")
+        video_delivery_items = _delivery_items_for_urls("video", videos)
+        sendable_video_count = sum(1 for item in video_delivery_items if item.get("send_method") != "dont_send")
         if videos:
-            _session_video_url_queue.setdefault(task_session_key, []).extend(videos)
+            _session_video_url_queue.setdefault(task_session_key, []).extend(video_delivery_items)
         blocked_count = len(audit_result.get("blocked") or [])
-        skipped_count = sum(1 for item in image_delivery_items if item.get("send_method") == "none")
+        skipped_count = int(image_report.get("skipped_count") or 0)
+        skipped_video_count = sum(1 for item in video_delivery_items if item.get("send_method") == "dont_send")
+        any_sendable = bool(sendable_image_count or sendable_video_count)
         results.append(
             {
                 "task_id": prompt_id,
                 "status": "completed",
                 "type": ftype,
+                "media_ready": bool(image_delivery_items or videos or audios),
+                "auto_send": any_sendable,
                 "image_count": len(image_delivery_items),
                 "sent_image_count": sendable_image_count,
                 "skipped_image_count": skipped_count,
                 "blocked_image_count": blocked_count,
                 "video_count": len(videos),
+                "sent_video_count": sendable_video_count,
+                "skipped_video_count": skipped_video_count,
                 "audio_count": len(audios),
+                "media_delivery_report": {"image": image_report} if image_delivery_items else {},
                 "texts": _filter_generated_texts_for_delivery(texts),
                 "description": "\n\n".join(_filter_generated_texts_for_delivery(texts)).strip(),
-                "auto_sent": bool(videos) and video_method != "none",
-                "delivery": "blocked_by_audit" if blocked_count and not sendable_image_count else ("partial_audit_block" if blocked_count else ("skipped_by_send_policy" if skipped_count and not sendable_image_count else ("queued_by_plugin" if videos else ""))),
-                "audit_records": audit_result.get("records") or [],
+                "delivery": "partial_audit_block" if blocked_count and any_sendable else ("blocked_by_audit" if blocked_count else ("skipped_by_send_policy" if (skipped_count + skipped_video_count) and not any_sendable else ("queued_by_plugin" if any_sendable else ""))),
+                "reason": "内容审核拦截，未自动发送。" if blocked_count and not any_sendable else ("按发送策略跳过，未自动发送。" if (skipped_count + skipped_video_count) and not any_sendable else ""),
+                "message": _llm_media_delivery_message_from_report(image_report, sendable_video_count),
             }
         )
         return
@@ -1416,40 +1499,51 @@ async def _append_completed_task_result(
             except Exception as e:
                 logger.warning("ComfyUI content audit failed: %s", e)
         image_delivery_items = _delivery_items_for_urls("image", delivery_images, audit_result.get("records") or [])
-        sendable_image_count = sum(1 for item in image_delivery_items if item.get("send_method") != "none")
+        image_report = _build_media_delivery_report("image", image_delivery_items)
+        sendable_image_count = int(image_report.get("queued_count") or 0)
         if image_delivery_items:
             _session_image_url_queue.setdefault(task_session_key, []).extend(image_delivery_items)
         blocked_count = len(audit_result.get("blocked") or [])
-        skipped_count = sum(1 for item in image_delivery_items if item.get("send_method") == "none")
+        skipped_count = int(image_report.get("skipped_count") or 0)
         filtered_texts = _filter_generated_texts_for_delivery(texts)
         results.append(
             {
                 "task_id": prompt_id,
                 "status": "completed",
                 "type": "image",
-                "url": url,
+                "media_ready": bool(image_delivery_items),
+                "auto_send": bool(sendable_image_count),
                 "image_count": len(image_delivery_items),
                 "sent_image_count": sendable_image_count,
                 "skipped_image_count": skipped_count,
                 "blocked_image_count": blocked_count,
-                "delivery": "blocked_by_audit" if blocked_count and not sendable_image_count else ("partial_audit_block" if blocked_count else ("skipped_by_send_policy" if skipped_count and not sendable_image_count else "")),
-                "audit_records": audit_result.get("records") or [],
+                "media_delivery_report": {"image": image_report},
+                "delivery": "blocked_by_audit" if blocked_count and not sendable_image_count else ("partial_audit_block" if blocked_count else ("skipped_by_send_policy" if skipped_count and not sendable_image_count else ("queued_by_plugin" if sendable_image_count else ""))),
+                "reason": "内容审核拦截，未自动发送。" if blocked_count and not sendable_image_count else ("按发送策略跳过，未自动发送。" if skipped_count and not sendable_image_count else ""),
+                "message": _llm_image_delivery_report_message(image_report),
                 "texts": filtered_texts,
                 "description": "\n\n".join(filtered_texts).strip(),
             }
         )
     elif ftype == "video":
-        _session_video_url_queue.setdefault(task_session_key, []).append(url)
+        video_delivery_items = _delivery_items_for_urls("video", [str(url)] if url else [])
+        sendable_video_count = sum(1 for item in video_delivery_items if item.get("send_method") != "dont_send")
+        if video_delivery_items:
+            _session_video_url_queue.setdefault(task_session_key, []).extend(video_delivery_items)
         filtered_texts = _filter_generated_texts_for_delivery(texts)
-        video_method = _resolve_send_method("video", "audit_disabled")
         results.append(
             {
                 "task_id": prompt_id,
                 "status": "completed",
                 "type": "video",
-                "auto_sent": video_method != "none",
-                "delivery": "skipped_by_send_policy" if video_method == "none" else "queued_by_plugin",
-                "message": "Video is queued for automatic sending. Do NOT call send_message_to_user. Reply with normal text only.",
+                "media_ready": bool(url),
+                "auto_send": bool(sendable_video_count),
+                "video_count": len(video_delivery_items),
+                "sent_video_count": sendable_video_count,
+                "skipped_video_count": sum(1 for item in video_delivery_items if item.get("send_method") == "dont_send"),
+                "delivery": "queued_by_plugin" if sendable_video_count else "skipped_by_send_policy",
+                "reason": "" if sendable_video_count else "按发送策略跳过，未自动发送。",
+                "message": _llm_media_delivery_message("Video") if sendable_video_count else "Video generated, but automatic sending was skipped by send policy.",
                 "texts": filtered_texts,
                 "description": "\n\n".join(filtered_texts).strip(),
             }
@@ -3064,12 +3158,9 @@ class ComfyUIPlugin(Star):
         session_key = getattr(event, "unified_msg_origin", None) or ""
         if not session_key and hasattr(event, "get_session_id"):
             session_key = event.get_session_id() or ""
-        # 取本会话图片 delivery item（FIFO）
-        iq = _session_image_url_queue.get(session_key) or _session_image_url_queue.get("default")
-        first_image_item = iq.pop(0) if (iq and len(iq) > 0) else None
-        ik = session_key if (session_key and _session_image_url_queue.get(session_key)) else "default"
-        if iq is not None and len(iq) == 0:
-            _session_image_url_queue.pop(ik, None)
+        # 图片只在实际插入时消费队列；没有占位符时会自动追加到本次回复末尾。
+        image_queue_key = session_key if (session_key and _session_image_url_queue.get(session_key)) else "default"
+        image_queue = _session_image_url_queue.get(image_queue_key)
         # 取本会话视频 delivery item（FIFO）
         vq = _session_video_url_queue.get(session_key) or _session_video_url_queue.get("default")
         video_items = list(vq or [])
@@ -3077,7 +3168,7 @@ class ComfyUIPlugin(Star):
         if vq is not None:
             _session_video_url_queue.pop(vk, None)
         first_video_item = video_items[0] if video_items else None
-        if not first_image_item and not video_items:
+        if not image_queue and not video_items:
             return
         try:
             result = event.get_result()
@@ -3086,7 +3177,7 @@ class ComfyUIPlugin(Star):
         if result is None:
             return
         chain = getattr(result, "chain", None)
-        if not chain or not isinstance(chain, list):
+        if chain is None or not isinstance(chain, list):
             return
         try:
             from astrbot.api.message_components import Image, Plain, Video
@@ -3094,46 +3185,45 @@ class ComfyUIPlugin(Star):
             from astrbot.api.message_components import Image, Plain
             Video = None  # 部分版本可能无 Video 组件
         new_chain: List[Any] = []
-        first_image_path_for_placeholder, first_image_notice_for_placeholder = await _prepare_image_delivery_for_send(
-            first_image_item, session_key
-        ) if first_image_item else (None, None)
+
+        async def _pop_next_image_delivery() -> tuple[Optional[str], Optional[str]]:
+            current_queue = _session_image_url_queue.get(image_queue_key)
+            if not current_queue:
+                return None, None
+            item = current_queue.pop(0)
+            if not current_queue:
+                _session_image_url_queue.pop(image_queue_key, None)
+            return await _prepare_image_delivery_for_send(item, session_key)
+
+        def _append_image_segment(image_path: Optional[str], image_notice: Optional[str]) -> None:
+            if image_path:
+                try:
+                    new_chain.append(Image.fromFileSystem(image_path))
+                except AttributeError:
+                    new_chain.append(Image.from_file_system(image_path))
+            elif image_notice:
+                new_chain.append(Plain(image_notice))
+
+        image_placeholder_seen = False
         # 先替换图片占位符
         for seg in chain:
             text = getattr(seg, "text", None) if seg is not None else None
             if text is not None and COMFYUI_IMAGE_PLACEHOLDER in (text if isinstance(text, str) else ""):
+                image_placeholder_seen = True
                 parts = (text or "").split(COMFYUI_IMAGE_PLACEHOLDER)
-                current_iq = _session_image_url_queue.get(session_key) or _session_image_url_queue.get("default")
-                # 重新从队列获取图片（每次占位符对应一张图）
-                current_iq = _session_image_url_queue.get(session_key) or _session_image_url_queue.get("default")
                 for i, p in enumerate(parts):
                     if p:
                         new_chain.append(Plain(p))
                     if i < len(parts) - 1:
-                        img_path = None
-                        img_notice = None
-                        if first_image_path_for_placeholder:
-                            img_path = first_image_path_for_placeholder
-                            first_image_path_for_placeholder = None
-                        elif first_image_notice_for_placeholder:
-                            img_notice = first_image_notice_for_placeholder
-                            first_image_notice_for_placeholder = None
-                        elif current_iq and len(current_iq) > 0:
-                            img_item = current_iq.pop(0)
-                            img_path, img_notice = await _prepare_image_delivery_for_send(img_item, session_key)
-                            # 更新队列
-                            if current_iq is not None and len(current_iq) == 0:
-                                ik = session_key if (session_key and _session_image_url_queue.get(session_key)) else "default"
-                                _session_image_url_queue.pop(ik, None)
-                        if img_path:
-                            try:
-                                new_chain.append(Image.fromFileSystem(img_path))
-                            except AttributeError:
-                                new_chain.append(Image.from_file_system(img_path))
-                            # 在消息中追加路径
-                        elif img_notice:
-                            new_chain.append(Plain(img_notice))
+                        img_path, img_notice = await _pop_next_image_delivery()
+                        _append_image_segment(img_path, img_notice)
             else:
                 new_chain.append(seg)
+        # 新协议：LLM 不需要写占位符。没有占位符时自动附图；有占位符但图比占位符多，也把剩余图片补在末尾。
+        if not image_placeholder_seen or _session_image_url_queue.get(image_queue_key):
+            while _session_image_url_queue.get(image_queue_key):
+                img_path, img_notice = await _pop_next_image_delivery()
+                _append_image_segment(img_path, img_notice)
         # 视频不与文本混在同一条消息：另存到持久化路径，消息中带出路径，再单独发一条视频
         video_path_for_send, video_notice_for_placeholder = await _prepare_video_delivery_for_send(
             first_video_item
