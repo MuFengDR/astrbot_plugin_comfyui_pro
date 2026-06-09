@@ -91,8 +91,7 @@ class ComfyUIExecuteTool(FunctionTool[AstrAgentContext]):
             return "插件配置不可用。"
         server_ip, client_id = runtime._get_server_config(config)
         wf_dir = runtime._get_workflow_dir()
-        ctx = getattr(context.context, "context", None)
-        event = getattr(ctx, "event", None) if ctx else None
+        event = runtime._get_event_from_context(context.context)
         submit = await runtime._submit_comfyui_workflow(
             context.context,
             workflow_name,
@@ -101,6 +100,7 @@ class ComfyUIExecuteTool(FunctionTool[AstrAgentContext]):
             image_urls_arg,
             session_tag,
             event,
+            origin="llm_tool",
         )
         if not submit.get("ok"):
             return submit.get("message", "执行失败。")

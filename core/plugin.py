@@ -180,15 +180,39 @@ def _get_websocket_wait_timeout(config: Any) -> int:
         return DEFAULT_QUERY_WAIT_SECONDS
 
 
+def _get_event_from_context(context: Any) -> Optional[Any]:
+    try:
+        event = getattr(context, "event", None)
+        agent_ctx = getattr(context, "context", None)
+        if event is None:
+            event = getattr(agent_ctx, "event", None) if agent_ctx else None
+        if event is None and agent_ctx is not None:
+            event = getattr(getattr(agent_ctx, "context", None), "event", None)
+        if event is None and hasattr(context, "extra"):
+            extra = getattr(context, "extra", None) or {}
+            if isinstance(extra, dict):
+                event = extra.get("event")
+        if event is None and agent_ctx is not None and hasattr(agent_ctx, "extra"):
+            extra = getattr(agent_ctx, "extra", None) or {}
+            if isinstance(extra, dict):
+                event = extra.get("event")
+        if event is None and (
+            hasattr(context, "unified_msg_origin")
+            or hasattr(context, "get_session_id")
+            or hasattr(context, "get_sender_id")
+            or hasattr(context, "message_obj")
+        ):
+            event = context
+        return event
+    except Exception as e:
+        logger.debug("get_event_from_context: %s", e)
+    return None
+
+
 def _get_session_key(context: Any) -> str:
     """从工具调用的 context 中解析会话 key（unified_msg_origin），拿不到时返回 'default' 以便仍能命中最近一次提交。"""
     try:
-        ctx = getattr(context, "context", None)
-        event = getattr(ctx, "event", None) if ctx else None
-        if event is None and ctx is not None:
-            event = getattr(getattr(ctx, "context", None), "event", None)
-        if event is None and hasattr(context, "unified_msg_origin"):
-            event = context
+        event = _get_event_from_context(context)
         if event is not None:
             umo = getattr(event, "unified_msg_origin", None) or ""
             if umo:
@@ -221,16 +245,7 @@ def _get_session_id_from_context(context: Any) -> Optional[str]:
         return None
 
     try:
-        agent_ctx = getattr(context, "context", None)
-        event = getattr(agent_ctx, "event", None) if agent_ctx else None
-        if event is None and agent_ctx is not None:
-            event = getattr(getattr(agent_ctx, "context", None), "event", None)
-        if event is None and agent_ctx is not None and hasattr(agent_ctx, "extra"):
-            extra = getattr(agent_ctx, "extra", None) or {}
-            if isinstance(extra, dict):
-                event = extra.get("event")
-        if event is None and (hasattr(context, "get_session_id") or hasattr(context, "message_obj")):
-            event = context
+        event = _get_event_from_context(context)
         sid = _sid_from_event(event)
         if sid is not None:
             return sid
@@ -242,21 +257,7 @@ def _get_session_id_from_context(context: Any) -> Optional[str]:
 def _get_sender_id_from_context(context: Any) -> Optional[str]:
     """从工具调用的 context 中解析发送者的 QQ 号（user_id）。"""
     try:
-        agent_ctx = getattr(context, "context", None)
-        event = getattr(agent_ctx, "event", None) if agent_ctx else None
-        if event is None and agent_ctx is not None:
-            event = getattr(getattr(agent_ctx, "context", None), "event", None)
-        if event is None and agent_ctx is not None and hasattr(agent_ctx, "extra"):
-            extra = getattr(agent_ctx, "extra", None) or {}
-            if isinstance(extra, dict):
-                event = extra.get("event")
-        if event is None and (
-            hasattr(context, "get_sender_id")
-            or hasattr(context, "user_id")
-            or hasattr(context, "sender")
-            or hasattr(context, "message_obj")
-        ):
-            event = context
+        event = _get_event_from_context(context)
         if event is None:
             return None
         # 尝试从 event 获取 sender 或 user_id
