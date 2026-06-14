@@ -511,6 +511,32 @@ def _delivery_items_for_urls(media_type: str, urls: List[str], audit_records: Op
     return items
 
 
+def _audit_fallback_task(prompt_id: str, server_ip: str, context: Any = None) -> Dict[str, Any]:
+    pending = _task_registry.get(str(prompt_id)) or {}
+    event = _get_event_from_context(context) if context is not None else None
+    session_key = str(pending.get("session_key") or "")
+    if not session_key and event is not None:
+        session_key = getattr(event, "unified_msg_origin", None) or ""
+        if not session_key and hasattr(event, "get_session_id"):
+            session_key = str(event.get_session_id() or "")
+    session_tag = str(pending.get("session_tag") or "")
+    origin = str(pending.get("origin") or "llm_tool")
+    return {
+        "task_id": str(prompt_id),
+        "prompt_id": str(prompt_id),
+        "origin": origin,
+        "origin_label": {"command": "command", "llm_tool": "LLM 工具", "webui": "WebUI"}.get(origin, origin),
+        "session_key": session_key,
+        "session_tag": session_tag,
+        "session_label": session_key if session_key and session_key not in {"default", "unknown"} else session_tag,
+        "workflow_name": pending.get("workflow_name") or "",
+        "workflow_file": pending.get("workflow_file") or "",
+        "server_ip": pending.get("server_ip") or server_ip,
+        "client_id": pending.get("client_id") or "",
+        "port_name": "",
+    }
+
+
 def _is_queued_send_method(method: str) -> bool:
     return normalize_send_method(method, "image") != "dont_send"
 
@@ -626,6 +652,11 @@ def _build_text_policy_delivery(texts: List[str]) -> tuple[List[str], Dict[str, 
         for index, text in enumerate(raw_texts, 1)
     ]
     return (raw_texts if queued else []), _build_text_delivery_report(raw_texts, records)
+
+
+def _filter_generated_texts_for_delivery(texts: List[str]) -> List[str]:
+    filtered, _ = _build_text_policy_delivery(texts)
+    return filtered
 
 
 async def _audit_texts_for_delivery(prompt_id: str, texts: List[str]) -> tuple[List[str], Dict[str, Any]]:
@@ -1507,11 +1538,20 @@ async def _append_completed_task_result(
         audit_result = {"allowed_images": images, "blocked": [], "records": []}
         if _task_service and images:
             try:
+                task_for_audit = completed_task or _audit_fallback_task(prompt_id, task_server_ip, context)
                 task_images = []
-                if completed_task and isinstance(completed_task.get("result"), dict):
-                    task_images = [str(u) for u in (completed_task["result"].get("images") or []) if u]
+                if isinstance(task_for_audit.get("result"), dict):
+                    task_images = [str(u) for u in (task_for_audit["result"].get("images") or []) if u]
                 delivery_images = task_images or delivery_images
-                audit_result = await _task_service.audit_task_images(completed_task, task_images or images)
+                audit_result = await _task_service.audit_task_images(task_for_audit, task_images or images)
+                if images and not (audit_result.get("records") or []):
+                    logger.info(
+                        "ComfyUI image audit skipped/no records: prompt_id=%s origin=%s session=%s images=%d",
+                        prompt_id,
+                        task_for_audit.get("origin"),
+                        task_for_audit.get("session_key") or task_for_audit.get("session_tag"),
+                        len(task_images or images),
+                    )
             except Exception as e:
                 logger.warning("ComfyUI content audit failed: %s", e)
         image_delivery_items = _delivery_items_for_urls("image", delivery_images, audit_result.get("records") or [])
@@ -1571,11 +1611,20 @@ async def _append_completed_task_result(
         delivery_images = [str(url)] if url else []
         if _task_service and url:
             try:
+                task_for_audit = completed_task or _audit_fallback_task(prompt_id, task_server_ip, context)
                 task_images = []
-                if completed_task and isinstance(completed_task.get("result"), dict):
-                    task_images = [str(u) for u in (completed_task["result"].get("images") or []) if u]
+                if isinstance(task_for_audit.get("result"), dict):
+                    task_images = [str(u) for u in (task_for_audit["result"].get("images") or []) if u]
                 delivery_images = task_images or delivery_images
-                audit_result = await _task_service.audit_task_images(completed_task, task_images or [url])
+                audit_result = await _task_service.audit_task_images(task_for_audit, task_images or [url])
+                if not (audit_result.get("records") or []):
+                    logger.info(
+                        "ComfyUI image audit skipped/no records: prompt_id=%s origin=%s session=%s images=%d",
+                        prompt_id,
+                        task_for_audit.get("origin"),
+                        task_for_audit.get("session_key") or task_for_audit.get("session_tag"),
+                        len(task_images or [url]),
+                    )
             except Exception as e:
                 logger.warning("ComfyUI content audit failed: %s", e)
         image_delivery_items = _delivery_items_for_urls("image", delivery_images, audit_result.get("records") or [])

@@ -154,7 +154,6 @@ class ComfyUIQueryWaitTool(FunctionTool[AstrAgentContext]):
                 continue
 
             url, ftype, texts = await runtime._get_result_for_prompt(task_server_ip, prompt_id, output_rules)
-            texts = runtime._filter_generated_texts_for_delivery(texts)
             if url or ftype in ("text", "error"):
                 runtime._cleanup_completed_task(prompt_id, task_session_tag)
                 await runtime._append_completed_task_result(
@@ -231,7 +230,6 @@ class ComfyUIQueryWaitTool(FunctionTool[AstrAgentContext]):
                 status = wait_result.get("status")
                 if status == "completed":
                     url, ftype, texts = await runtime._get_result_for_prompt(item["server_ip"], prompt_id, item.get("output_rules"))
-                    texts = runtime._filter_generated_texts_for_delivery(texts)
                     runtime._cleanup_completed_task(prompt_id, item["session_tag"])
                     await runtime._append_completed_task_result(
                         results,
@@ -262,7 +260,6 @@ class ComfyUIQueryWaitTool(FunctionTool[AstrAgentContext]):
                     )
                 else:
                     url, ftype, texts = await runtime._get_result_for_prompt(item["server_ip"], prompt_id, item.get("output_rules"))
-                    texts = runtime._filter_generated_texts_for_delivery(texts)
                     if url or ftype in ("text", "error"):
                         runtime._cleanup_completed_task(prompt_id, item["session_tag"])
                         await runtime._append_completed_task_result(
